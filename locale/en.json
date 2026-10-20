@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "TTSR — Time-Traveling Stream Rules",
+    "description": "Dormant regex rules that watch the model's output stream, abort a violating attempt mid-token, inject the matched rule as a reminder, and retry the same step. Ships /omfg rule generation and /ttsr management."
+  }
+}
