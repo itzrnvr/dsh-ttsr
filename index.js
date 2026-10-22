@@ -250,6 +250,7 @@ function apply(ctx, config = {}) {
         pending: null, // { nonce, violations } awaiting the request-error retry
         stepRetries: new Map(), // "turn:step" -> count
         currentStepKey: "",
+        currentTurn: 0,
         injected: new Set(), // rule names injected in this process
         injectedAtTurn: new Map(), // rule name -> turn number at injection
         passiveTools: new Map(), // `${sessionId}:${callId}` -> reminder message
@@ -276,6 +277,12 @@ function apply(ctx, config = {}) {
       }
     } catch {}
     return null;
+  }
+
+  /** Mark a rule injected, recording the turn it fired at for after-gap repeats. */
+  function markInjected(state, ruleName, turn) {
+    state.injected.add(ruleName);
+    state.injectedAtTurn.set(ruleName, Number.isInteger(turn) ? turn : (state.currentTurn ?? 0));
   }
 
   // ---- durable repeat state, derived from the session log ----
@@ -315,6 +322,11 @@ function apply(ctx, config = {}) {
       if (state !== undefined && Number.isInteger(event.data?.turn) && Number.isInteger(event.data?.step)) {
         state.currentStepKey = `${event.data.turn}:${event.data.step}`;
       }
+      return;
+    }
+    if (event.type === "turn/start") {
+      const state = live.get(session.id);
+      if (state !== undefined && Number.isInteger(event.data?.turn)) state.currentTurn = event.data.turn;
       return;
     }
     if (event.type === "assistant/message") {
@@ -490,7 +502,7 @@ function apply(ctx, config = {}) {
                   } else if (source === "text" || source === "reasoning") {
                     passiveProseViolation = match;
                   }
-                  state.injected.add(match.rule.name);
+                  markInjected(state, match.rule.name);
                 }
                 // Interrupt allowed but retries exhausted: stay silent — the rule has
                 // already been injected maxRetriesPerStep times for this step.
@@ -579,7 +591,7 @@ function apply(ctx, config = {}) {
           const canInterrupt = interruptAllowed(violation.rule, "tool");
           if (canInterrupt && state.astDenies <= settings.maxRetriesPerStep) {
             state.astDenies += 1;
-            state.injected.add(violation.rule.name);
+            markInjected(state, violation.rule.name);
             try {
               exec.agent.inject(reminderMessage([violation], "interrupt"));
             } catch (error) {
@@ -592,7 +604,7 @@ function apply(ctx, config = {}) {
             };
           }
           if (!canInterrupt) {
-            state.injected.add(violation.rule.name);
+            markInjected(state, violation.rule.name);
             try {
               exec.agent.inject(reminderMessage([violation], "observe"));
             } catch {}
@@ -718,7 +730,7 @@ function apply(ctx, config = {}) {
       const violations = [];
       for (const rule of flagged) {
         if (state.injected.has(rule.name)) continue;
-        state.injected.add(rule.name);
+        markInjected(state, rule.name);
         violations.push({ rule, excerpt: output.content.slice(0, 120) });
       }
       if (violations.length === 0) continue;
@@ -791,8 +803,7 @@ function apply(ctx, config = {}) {
     const attempt = (state.stepRetries.get(stepKey) ?? 0) + 1;
     state.stepRetries.set(stepKey, attempt);
     for (const violation of pending.violations) {
-      state.injected.add(violation.rule.name);
-      state.injectedAtTurn.set(violation.rule.name, turn);
+      markInjected(state, violation.rule.name, turn);
     }
 
     const retryId = randomUUID();
