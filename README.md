@@ -26,6 +26,27 @@ file extension marks them as code.
 style: `*`/`?` within a segment, a `**` segment matches zero or more whole segments; tested
 against the full path and the basename).
 
+## The judge backend
+
+Question rules are judged by a **decision model** speaking the System One wire
+(`POST /v1/systemone`: one state + up to 16 questions, answers as calibrated
+probabilities). Two backends:
+
+- **`kind: qev` (default here)** — a local [qev-0.8b](https://huggingface.co/labqoat/qev-0.8b-GGUF)
+  (0.8B decision model, Apache-2.0) served by a **CPU-only llama-server** at
+  `judge.baseUrl` (default `http://127.0.0.1:8790`). The plugin spawns and manages
+  the process itself from `judge.launch` (killed on plugin unload). The CPU build
+  has no CUDA linkage, so it uses **zero VRAM** and cannot interfere with GPU
+  benchmark work; a judgment of a ~2k-token state takes 1–4 s. The judge state is
+  `{user_request, response}` (request + output, middle-truncated), so questions
+  about "work the user asked for" are answerable. Falls back to the chat judge if
+  the decision server cannot be reached.
+- **`kind: chat`** — a low-effort call to the session's own model route (or the
+  `generator` override), with the same request-aware state.
+
+`judge.threshold` (default 0.7) sets the flag line on the returned probability.
+Subagent sessions are not monitored unless `monitorSubagents: true`.
+
 ## How the time travel works
 
 ```
@@ -65,7 +86,7 @@ the violating attempt never becomes model-visible, and the rule text rides the r
 
 | Command | What it does |
 | --- | --- |
-| `/omfg <description>` | Generates rule candidates with the session's model (route taken from the last assistant message, or the `generator` config), validates each regex (must compile, must not match the empty string), counts matches against recent assistant output, then shows a **native multi-select confirm card**. Selected rules are persisted through `configEditor` into the user's `cordis.patch.yml` patch layer and the rulebook reloads live. |
+| `/omfg <description>` | Generates rule candidates with the session's model. The generator reads a **full transcript** (user messages in full, recent assistant output near-full, up to ~120k chars) at medium reasoning effort, and must quote **verbatim evidence** of the offense from the conversation. Validation rejects any candidate whose evidence cannot be found in the transcript, and any regex that does not match its own evidence — generic rules cannot survive. Surviving candidates show evidence + match counts in a **native multi-select confirm card**; selected rules persist through `configEditor` into the user's `cordis.patch.yml` and the rulebook reloads live. |
 | `/ttsr` | Lists rules with scope/interrupt/repeat settings and enabled state. |
 | `/ttsr test <regex>` | Counts matches of a regex across this session's assistant text and tool-call arguments. |
 | `/ttsr forget <name>` | Removes a rule (persisted through `configEditor`). |

@@ -47,6 +47,17 @@ const Config = z.object({
   enabled: z.boolean().default(true),
   maxRetriesPerStep: z.number().default(2),
   retryDelayMs: z.number().default(250),
+  monitorSubagents: z.boolean().default(false),
+  judge: z.object({
+    kind: z.string(),
+    baseUrl: z.string(),
+    threshold: z.number(),
+    launch: z.object({
+      command: z.string().required(),
+      args: z.array(z.string()).default([]),
+      cwd: z.string(),
+    }),
+  }),
   generator: z.object({
     provider: z.string(),
     model: z.string(),
@@ -168,6 +179,20 @@ function resolveSettings(config, logger) {
     value.generator.model.length > 0
       ? { provider: value.generator.provider, model: value.generator.model }
       : undefined;
+  const rawJudge = value.judge ?? {};
+  const judge = {
+    kind: rawJudge.kind === "qev" ? "qev" : "chat",
+    baseUrl: typeof rawJudge.baseUrl === "string" && rawJudge.baseUrl.length > 0 ? rawJudge.baseUrl : "http://127.0.0.1:8790",
+    threshold: Number.isFinite(rawJudge.threshold) && rawJudge.threshold > 0.5 && rawJudge.threshold < 1 ? rawJudge.threshold : 0.7,
+    launch:
+      typeof rawJudge.launch?.command === "string" && rawJudge.launch.command.length > 0
+        ? {
+            command: rawJudge.launch.command,
+            args: Array.isArray(rawJudge.launch.args) ? rawJudge.launch.args.filter((entry) => typeof entry === "string") : [],
+            ...(typeof rawJudge.launch.cwd === "string" && rawJudge.launch.cwd.length > 0 ? { cwd: rawJudge.launch.cwd } : {}),
+          }
+        : undefined,
+  };
   const rules = [];
   const seen = new Set();
   for (const raw of Array.isArray(value.rules) ? value.rules : []) {
@@ -180,7 +205,7 @@ function resolveSettings(config, logger) {
     seen.add(rule.name);
     rules.push(rule);
   }
-  return { enabled, maxRetriesPerStep, retryDelayMs, generator, rules };
+  return { enabled, maxRetriesPerStep, retryDelayMs, generator, judge, monitorSubagents: value.monitorSubagents === true, rules };
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +310,84 @@ function apply(ctx, config = {}) {
     state.injectedAtTurn.set(ruleName, Number.isInteger(turn) ? turn : (state.currentTurn ?? 0));
   }
 
+  /** Whether a session's stream should be monitored: root agents only unless configured. */
+  function isMonitoredSession(sessionId) {
+    if (settings.monitorSubagents) return true;
+    try {
+      const agent = ctx.agents.get(sessionId);
+      if (agent === undefined) return true; // unknown live session: monitor rather than miss
+      return ctx.agents.roots().includes(agent);
+    } catch {
+      return true;
+    }
+  }
+
+  // ---- qev decision server (CPU llama-server behind /v1/systemone) ----------
+  let qevProcess = null;
+  ctx.effect(() => () => {
+    try {
+      qevProcess?.kill();
+    } catch {}
+    qevProcess = null;
+  }, "dsh-ttsr: qev judge server");
+
+  async function qevHealthy(baseUrl) {
+    try {
+      const response = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(1500) });
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  async function waitForQev(baseUrl, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await qevHealthy(baseUrl)) return true;
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    }
+    return false;
+  }
+
+  async function ensureQev() {
+    const baseUrl = settings.judge.baseUrl;
+    if (await qevHealthy(baseUrl)) return baseUrl;
+    const launch = settings.judge.launch;
+    if (launch === undefined) return baseUrl; // externally managed
+    if (qevProcess !== null && qevProcess.exitCode === null) {
+      await waitForQev(baseUrl, 60000);
+      return baseUrl;
+    }
+    try {
+      const { spawn } = await import("node:child_process");
+      qevProcess = spawn(launch.command, launch.args, {
+        ...(launch.cwd !== undefined ? { cwd: launch.cwd } : {}),
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      qevProcess.on("exit", () => {
+        qevProcess = null;
+      });
+    } catch (error) {
+      warnOnce(ctx.logger ?? console, "qev", `could not spawn the judge server: ${error.message}`);
+      return baseUrl;
+    }
+    await waitForQev(baseUrl, 90000);
+    return baseUrl;
+  }
+
+  async function qevDecide(baseUrl, state, questions) {
+    const response = await fetch(`${baseUrl}/v1/systemone`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ state, questions }),
+      signal: AbortSignal.timeout(45000),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    return payload?.answers ?? {};
+  }
+
   // ---- durable repeat state, derived from the session log ----
   try {
     ctx.sessionProjections.register({
@@ -332,7 +435,7 @@ function apply(ctx, config = {}) {
     if (event.type === "assistant/message") {
       const state = live.get(session.id);
       if (state !== undefined) state.astDenies = 0;
-      if (settings.enabled && questionRules.length > 0 && event.data?.message?.content !== undefined) {
+      if (settings.enabled && questionRules.length > 0 && event.data?.message?.content !== undefined && isMonitoredSession(session.id)) {
         queueJudgment(session, event.data.message);
       }
     }
@@ -413,6 +516,7 @@ function apply(ctx, config = {}) {
     if (!settings.enabled || rules.length === 0) return next();
     if (options.purpose !== undefined || options.sessionId === undefined) return next();
     if (INTERNAL_REQUESTS.has(options)) return next();
+    if (!isMonitoredSession(options.sessionId)) return next();
     return monitoredStream(options, next);
   });
 
@@ -582,6 +686,7 @@ function apply(ctx, config = {}) {
         active &&
         astRules.length > 0 &&
         exec.agent !== undefined &&
+        isMonitoredSession(exec.agent.id) &&
         exec.arguments !== null &&
         typeof exec.arguments === "object"
       ) {
@@ -661,7 +766,60 @@ function apply(ctx, config = {}) {
     return map;
   }
 
-  async function judgeOutput(session, message, output, candidates) {
+  function truncateMiddle(text, limit) {
+    if (text.length <= limit) return text;
+    const head = Math.floor(limit * 0.35);
+    const tail = limit - head;
+    return `${text.slice(0, head)}\n…[middle cut]…\n${text.slice(text.length - tail)}`;
+  }
+
+  function lastUserRequest(agent) {
+    try {
+      const messages = agent.session.deriveMessages();
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (message?.role !== "user" || message?.source?.kind !== "user") continue;
+        const text = (message.content ?? [])
+          .filter((block) => block?.type === "text")
+          .map((block) => block.text)
+          .join("\n");
+        if (text.trim().length === 0) continue;
+        return text.length > 1500 ? `${text.slice(0, 1500)}…` : text;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function judgeOutput(session, message, output, candidates, userRequest) {
+    if (settings.judge.kind === "qev") {
+      try {
+        const baseUrl = await ensureQev();
+        const questions = {};
+        for (const rule of candidates) {
+          questions[rule.name] = { type: "noul", instructions: rule.question };
+        }
+        const state = {
+          role: "assistant",
+          output_kind: output.kind,
+          user_request: userRequest ?? "(the user's request is not available)",
+          response: truncateMiddle(output.content, 8000),
+        };
+        const answers = await qevDecide(baseUrl, state, questions);
+        const threshold = settings.judge.threshold;
+        return candidates.filter((rule) => {
+          const noul = answers[rule.name]?.noul;
+          return typeof noul === "number" && noul >= threshold;
+        });
+      } catch (error) {
+        warnOnce(ctx.logger ?? console, "qev", `qev judge failed (${error.message}); falling back to the chat judge`);
+      }
+    }
+    return judgeWithChat(session, message, output, candidates, userRequest);
+  }
+
+  async function judgeWithChat(session, message, output, candidates, userRequest) {
     const llm = getLlm();
     if (llm === undefined) return [];
     const route =
@@ -672,7 +830,12 @@ function apply(ctx, config = {}) {
     if (route === null) return [];
     const content = output.content.length > 12000 ? `${output.content.slice(0, 12000)}\n…[truncated]` : output.content;
     const prompt = [
-      "Judge whether one assistant output violates any of the rules below. Each rule is a yes/no question about the output.",
+      "Judge whether one assistant output violates any of the rules below. Each rule is a yes/no question about the output in the context of the user's request.",
+      "",
+      "User's request:",
+      "<request>",
+      userRequest ?? "(the user's request is not available)",
+      "</request>",
       "",
       "Rules:",
       ...candidates.map((rule) => `- id: ${rule.name}\n  question: ${rule.question}`),
@@ -708,6 +871,7 @@ function apply(ctx, config = {}) {
     })();
     if (agent === undefined) return;
     const state = stateOf(session.id);
+    const userRequest = lastUserRequest(agent);
     for (const output of messageOutputs(message)) {
       if (output.content.length < 40) continue;
       const candidates = questionRules
@@ -725,7 +889,7 @@ function apply(ctx, config = {}) {
         })
         .slice(0, 5);
       if (candidates.length === 0) continue;
-      const flagged = await judgeOutput(session, message, output, candidates);
+      const flagged = await judgeOutput(session, message, output, candidates, userRequest);
       if (flagged.length === 0) continue;
       const violations = [];
       for (const rule of flagged) {
@@ -973,25 +1137,30 @@ const OMFG_SYSTEM = [
 
 function omfgUserPrompt(description, transcript, existing) {
   return [
-    `The user wants to block this behavior: "${description}"`,
+    "You write TTSR enforcement rules for an agent harness. A rule watches the assistant's live output and fires when the assistant misbehaves.",
     "",
-    existing.length > 0 ? `Existing rules (do not duplicate them): ${existing.join(", ")}` : "No rules exist yet.",
+    "The user's complaint, verbatim:",
+    "<complaint>",
+    description,
+    "</complaint>",
     "",
-    "Recent conversation for context:",
+    existing.length > 0 ? `Existing rules (do not duplicate them; make the new rules MORE specific than these): ${existing.join(", ")}` : "No rules exist yet.",
+    "",
+    "The conversation follows. Work in two steps. STEP 1: read the conversation and find the EXACT places where the assistant did what the user is complaining about — quote them verbatim. STEP 2: write rules that would have fired on exactly those quotes and would NOT have fired on the assistant's diligent work in the same conversation.",
+    "",
+    "<conversation>",
     transcript,
+    "</conversation>",
     "",
     "Write 1-3 rules as a JSON object of this exact shape:",
-    '{"rules":[{"name":"kebab-case-id","condition":"javascript regex source","astCondition":"code pattern with metavariables","question":"yes/no question for an LLM judge","message":"imperative instruction","scope":["text","tool"],"globs":["*.ts"],"interruptMode":"always","repeatMode":"once"}]}',
-    "Trigger types (prefer these two; use at most one unless combining deliberately):",
-    "- condition: a JavaScript regex source string matched against the assistant's raw output (prose and tool-call argument JSON). Escape regex metacharacters when matching literal text. Keep it under 120 characters. It must not match the empty string.",
-    '- astCondition: a structural code pattern with metavariables, matched against the code that edit/write tools produce (new_string or full content). Metavariables: $VAR matches exactly one token, $$$ARGS matches any span of tokens. Example: "console.log($$$ARGS)" matches any console.log call. Whitespace-insensitive. Only usable with scope ["tool"], ideally with globs.',
-    '- question: a precise yes/no question for a separate judge model, evaluated after an output completes. Use it when the user explicitly asks for the question/judged trigger type, or when the violation is semantic or tonal and neither regex nor a pattern can express it (e.g. "does this response claim completion without verification?"). Do NOT approximate a semantic judgment with a keyword regex. Costs one extra model call per output.',
-    'Other fields:',
-    '- scope: a subset of ["text","reasoning","tool"]. Use ["tool"] for violations in file edits or command arguments; ["text","tool"] for general output.',
-    '- globs: optional file globs (e.g. ["src/**/*.ts"]) restricting tool-scope matching to those paths.',
-    "- message: one short imperative sentence the model must follow (for example: \"Do not use Box::leak; use Arc<str> instead.\").",
-    '- interruptMode: "always" normally; "never" only for observe-only rules.',
-    '- repeatMode: "once" (fire once per session) normally.',
+    '{"rules":[{"name":"kebab-case-id","condition":"javascript regex","astCondition":"code pattern","question":"yes/no question","message":"imperative instruction","evidence":["verbatim quote from the conversation that this rule must catch"],"scope":["text","tool"],"globs":["*.ts"],"interruptMode":"always","repeatMode":"once"}]}',
+    "Requirements:",
+    "- evidence (required): at least one verbatim quote, 10-200 characters, copied character-for-character from the conversation above, showing the exact offending behavior. A rule whose evidence cannot be found in the conversation is rejected.",
+    "- condition: a JavaScript regex that MUST match your own evidence quotes, and must not match the diligent parts of the conversation. Be specific: use the phrases the assistant actually used, not abstract categories. Escape regex metacharacters. It must not match the empty string.",
+    '- astCondition: a structural code pattern with metavariables ($VAR one token, $$$ARGS any span), matched against code that edit/write tools produce. Only with scope ["tool"], ideally with globs. Example: "console.log($$$ARGS)".',
+    "- question: a precise yes/no question for a judgment model that reads the user's request and the response together. Use it when the wording varies too much for a regex; name the specific behavior from the complaint and evidence.",
+    "- message: one imperative sentence the assistant must follow when the rule fires, written for THIS complaint — not a generic anti-laziness slogan.",
+    "- Do not write rules for behaviors that do not appear in your evidence. Do not write generic rules.",
     "Return ONLY the JSON object. No prose, no code fences.",
   ]
     .filter(Boolean)
@@ -1017,24 +1186,55 @@ function lastAssistantRoute(messages) {
   return null;
 }
 
-function renderTranscript(messages, byteLimit = 24000) {
+function renderTranscript(messages, budget = 120000) {
   const lines = [];
   let total = 0;
+  const assistantTotal = messages.filter((message) => message?.role === "assistant").length;
+  let assistantSeen = 0;
   for (const message of messages) {
     const parts = [];
-    for (const block of message.content ?? []) {
-      if (block.type === "text") parts.push(block.text.slice(0, 1500));
-      else if (block.type === "reasoning") parts.push(`(reasoning) ${block.text.slice(0, 300)}`);
-      else if (block.type === "tool-call") parts.push(`tool ${block.name}(${String(block.arguments).slice(0, 600)})`);
+    if (message?.role === "user" && message?.source?.kind === "user") {
+      for (const block of message.content ?? []) {
+        if (block?.type === "text") parts.push(block.text.slice(0, 3000));
+      }
+    } else if (message?.role === "user") {
+      for (const block of message.content ?? []) {
+        if (block?.type === "text") parts.push(`(injected context) ${block.text.slice(0, 400)}`);
+      }
+    } else if (message?.role === "assistant") {
+      assistantSeen += 1;
+      const remaining = assistantTotal - assistantSeen;
+      const cap = remaining < 12 ? 2500 : remaining < 40 ? 700 : 250;
+      for (const block of message.content ?? []) {
+        if (block?.type === "text") parts.push(block.text.slice(0, cap));
+        else if (block?.type === "reasoning") parts.push(`(reasoning) ${block.text.slice(0, 200)}`);
+        else if (block?.type === "tool-call") parts.push(`tool ${block.name}(${String(block.arguments).slice(0, 300)})`);
+      }
+    } else if (message?.role === "tool") {
+      for (const block of message.content ?? []) {
+        if (block?.type === "text") parts.push(`(tool result) ${block.text.slice(0, 200)}`);
+      }
     }
     if (parts.length > 0) {
       const line = `${message.role}: ${parts.join(" ")}`;
       lines.push(line);
       total += line.length;
-      if (total > byteLimit) break;
+      if (total > budget) break;
     }
   }
   return lines.join("\n");
+}
+
+function normalizeForGrounding(text) {
+  return String(text ?? "").replace(/\s+/g, " ").trim();
+}
+
+function evidenceIsGrounded(quote, groundingText) {
+  const normalized = normalizeForGrounding(quote);
+  if (normalized.length < 12) return false;
+  if (groundingText.includes(normalized)) return true;
+  const prefix = normalized.slice(0, 60);
+  return prefix.length >= 12 && groundingText.includes(prefix);
 }
 
 function assistantCorpus(messages) {
@@ -1079,13 +1279,31 @@ function slugify(value) {
   return slug.length > 0 ? slug : `rule-${randomUUID().slice(0, 6)}`;
 }
 
-function validateCandidates(candidates, corpus, existingNames, logger) {
+function validateCandidates(candidates, corpus, existingNames, groundingText, logger) {
   const validated = [];
+  const rejected = [];
   const names = new Set(existingNames);
+  const grounding = normalizeForGrounding(groundingText);
   for (const raw of candidates.slice(0, 5)) {
     const condition = typeof raw.condition === "string" ? raw.condition : "";
     const astCondition = typeof raw.astCondition === "string" ? raw.astCondition.trim() : "";
     const question = typeof raw.question === "string" ? raw.question.trim() : "";
+    const evidence = (Array.isArray(raw.evidence) ? raw.evidence : typeof raw.evidence === "string" ? [raw.evidence] : [])
+      .filter((entry) => typeof entry === "string" && entry.trim().length >= 10)
+      .map((entry) => entry.trim().slice(0, 300));
+    const reject = (reason) => {
+      rejected.push(reason);
+      warnOnce(logger, "omfg", reason);
+    };
+    if (evidence.length === 0) {
+      reject(`candidate "${String(raw.name ?? "?")}" rejected: no evidence quote`);
+      continue;
+    }
+    const grounded = evidence.filter((quote) => evidenceIsGrounded(quote, grounding));
+    if (grounded.length === 0) {
+      reject(`candidate "${String(raw.name ?? "?")}" rejected: evidence quote not found in the conversation`);
+      continue;
+    }
     const rule = compileRule(
       {
         name: typeof raw.name === "string" && raw.name.length > 0 ? raw.name : slugify(raw.name ?? raw.condition ?? "rule"),
@@ -1104,7 +1322,23 @@ function validateCandidates(candidates, corpus, existingNames, logger) {
     );
     if (rule === null) continue;
     if (names.has(rule.name)) continue;
-    if (condition.length > 0 && new RegExp(`^(?:${condition})$`, "m").test("")) continue; // matches empty output — too broad
+    if (condition.length > 0 && new RegExp(`^(?:${condition})$`, "m").test("")) {
+      reject(`candidate "${rule.name}" rejected: condition matches the empty string`);
+      continue;
+    }
+    if (condition.length > 0) {
+      let matchesEvidence = false;
+      for (const quote of grounded) {
+        if (new RegExp(condition, "m").test(quote)) {
+          matchesEvidence = true;
+          break;
+        }
+      }
+      if (!matchesEvidence) {
+        reject(`candidate "${rule.name}" rejected: the regex does not match its own evidence quote`);
+        continue;
+      }
+    }
     names.add(rule.name);
     let hits = 0;
     try {
@@ -1122,23 +1356,27 @@ function validateCandidates(candidates, corpus, existingNames, logger) {
         }
       }
     } catch {}
-    validated.push({ ...rule, hits });
+    validated.push({ ...rule, hits, evidence: grounded });
   }
-  return validated;
+  return { validated, rejected };
 }
 
-async function callGenerationModel(llm, route, system, prompt, sessionId, signal) {
-  // Auxiliary calls (rule generation, judging) do not need deep reasoning; pin a
-  // low effort when the route exposes one so reasoning cannot consume the budget.
-  const call = await llm.prepareCall({ provider: route.provider, model: route.model, maxTokens: 4096 }, signal, (controls, model) => {
+async function callGenerationModel(llm, route, system, prompt, sessionId, signal, options = {}) {
+  // Auxiliary calls (rule generation, judging) do not need deep reasoning by default;
+  // pick a low effort when the route exposes one so reasoning cannot consume the budget.
+  const effortPreference = Array.isArray(options.effortPreference) && options.effortPreference.length > 0
+    ? options.effortPreference
+    : ["low", "medium", "high", "min"];
+  const maxTokens = Number.isInteger(options.maxTokens) && options.maxTokens > 0 ? options.maxTokens : 4096;
+  const call = await llm.prepareCall({ provider: route.provider, model: route.model, maxTokens }, signal, (controls, model) => {
     const efforts = model?.reasoning?.efforts;
     if (Array.isArray(efforts)) {
-      const preferred = ["low", "medium", "high", "min"].find((id) => efforts.some((effort) => effort?.id === id));
+      const preferred = effortPreference.find((id) => efforts.some((effort) => effort?.id === id));
       if (preferred !== undefined) return { ...controls, reasoningEffort: preferred };
     }
     return controls;
   });
-  const options = Object.freeze({
+  const request = Object.freeze({
     ...call.config,
     system,
     sessionId,
@@ -1152,9 +1390,9 @@ async function callGenerationModel(llm, route, system, prompt, sessionId, signal
       },
     ],
   });
-  INTERNAL_REQUESTS.add(options);
+  INTERNAL_REQUESTS.add(request);
   let text = "";
-  for await (const chunk of call.stream(options)) {
+  for await (const chunk of call.stream(request)) {
     if (chunk.type === "text-delta") text += chunk.text;
     else if (chunk.type === "finish") {
       if (chunk.reason.kind === "error" || chunk.reason.kind === "aborted") {
@@ -1208,7 +1446,7 @@ async function runOmfg(ctx, settings, rules, invocation) {
   if (llm === undefined) return { kind: "error", text: "TTSR: the llm service is unavailable in this profile." };
 
   const messages = safeDerivedMessages(agent);
-  const transcript = renderTranscript(messages.slice(-40));
+  const transcript = renderTranscript(messages);
   if (transcript.length === 0) {
     return { kind: "error", text: "TTSR: no conversation to analyze yet — send a message first." };
   }
@@ -1223,16 +1461,28 @@ async function runOmfg(ctx, settings, rules, invocation) {
   const prompt = omfgUserPrompt(description, transcript, rules.map((rule) => rule.name));
   let generated;
   try {
-    generated = await callGenerationModel(llm, route, OMFG_SYSTEM, prompt, agent.id, signal);
+    // Rule generation must genuinely understand the complaint: read the full
+    // context with real reasoning effort and room for quoted evidence.
+    generated = await callGenerationModel(llm, route, OMFG_SYSTEM, prompt, agent.id, signal, {
+      effortPreference: ["medium", "high", "low"],
+      maxTokens: 8192,
+    });
   } catch (error) {
     return { kind: "error", text: `TTSR: rule generation failed: ${error.message}` };
   }
 
-  const candidates = validateCandidates(parseCandidates(generated), assistantCorpus(messages), rules.map((rule) => rule.name), ctx.logger ?? console);
+  const { validated: candidates, rejected } = validateCandidates(
+    parseCandidates(generated),
+    assistantCorpus(messages),
+    rules.map((rule) => rule.name),
+    `${transcript}\n${description}`,
+    ctx.logger ?? console,
+  );
   if (candidates.length === 0) {
+    const rejectionNotes = rejected.length > 0 ? `\nRejected candidates:\n- ${rejected.join("\n- ")}` : "";
     return {
       kind: "error",
-      text: `TTSR: the model produced no usable rules. Raw generation (first 500 characters):\n${generated.slice(0, 500)}`,
+      text: `TTSR: the model produced no usable rules. Raw generation (first 500 characters):\n${generated.slice(0, 500)}${rejectionNotes}`,
     };
   }
 
@@ -1252,7 +1502,8 @@ async function runOmfg(ctx, settings, rules, invocation) {
                   ? `ast: ${candidate.astCondition}`
                   : `judge: ${candidate.question}`;
             const hits = candidate.condition !== undefined ? `${candidate.hits} recent match(es)` : "fires on future output";
-            return { label: candidate.name, description: `${trigger} — ${hits}; ${candidate.message}` };
+            const evidence = candidate.evidence !== undefined && candidate.evidence.length > 0 ? ` catches: "${candidate.evidence[0].slice(0, 90)}"` : "";
+            return { label: candidate.name, description: `${trigger} —${evidence}; ${hits}; ${candidate.message}` };
           }),
           multiSelect: true,
         },
