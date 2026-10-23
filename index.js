@@ -1073,6 +1073,8 @@ async function runTtsr(ctx, settings, rules, invocation) {
       });
       selected = answer.answers.find((item) => item.id === "muted")?.selected ?? null;
     } catch (error) {
+      const quiet = error?.code === "ASK_ABORTED" || /cancel|abort|dismiss/i.test(String(error?.message ?? ""));
+      if (quiet) return { kind: "success", text: "TTSR: rule panel closed without changes." };
       return { kind: "error", text: `TTSR: could not open the rule panel (${error.message}). Use /ttsr off <name> instead.` };
     }
     if (selected === null) return { kind: "success", text: "TTSR: rule panel closed without changes." };
