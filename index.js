@@ -1165,7 +1165,7 @@ function apply(ctx, config = {}) {
     if (mute) next.add(target.name);
     else next.delete(target.name);
     applyMutes(invocation.agent, next);
-    return { kind: "success", text: `${SET_PREFIX}${JSON.stringify({ rules: ruleSnapshot(stateOf(invocation.agent)) })}` };
+    return { kind: "success", text: `${SET_PREFIX}${JSON.stringify({ rules: ruleSnapshot(stateOf(invocation.agent.id)) })}` };
   }
 
   const sessionHelpers = { applyMutes, setSessionRule, syncDisabled, ruleSnapshot, sessionOf };

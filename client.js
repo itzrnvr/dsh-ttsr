@@ -215,9 +215,10 @@ window.__ModuleLoader__.load({
       );
     }
 
-    const inject = ["uiConversation", "slots", "locale", "remote"];
+    const inject = ["uiConversation", "slots", "locale", "remote", "remote.commands"];
 
     function apply(ctx) {
+      try {
       ctx.effect(() => ctx.locale.register(NS, dictionaries), `${NS}: dictionaries`);
 
       ctx.uiConversation.events.register({
@@ -325,7 +326,8 @@ window.__ModuleLoader__.load({
         const execute = remote?.commands?.execute;
         if (typeof execute !== "function") throw new Error("commands remote is unavailable");
         const execution = await execute(sessionId, line, [], undefined);
-        return execution?.result?.text ?? execution?.text ?? "";
+        const outcome = execution?.ok === true && execution?.value !== undefined ? execution.value : execution;
+        return outcome?.result?.text ?? outcome?.text ?? "";
       };
 
       const load = async () => {
@@ -467,6 +469,9 @@ window.__ModuleLoader__.load({
           (props) => TtsrDockPanel(props, ctxRef),
         ),
       );
+      } catch (applyError) {
+        console.error("[ttsr-module] apply failed:", applyError);
+      }
     }
 
     const module = { exports: {} };
