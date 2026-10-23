@@ -30,6 +30,8 @@ window.__ModuleLoader__.load({
         ruleLabel: "rule",
         panelTitle: "TTSR rules — this session",
         panelNote: "Toggles apply to this session only; the global config is untouched. Mutes survive reload.",
+        dockButton: "TTSR rules",
+        noRules: "No rules configured — use /omfg <description>.",
         on: "ON",
         off: "OFF",
       },
@@ -42,6 +44,8 @@ window.__ModuleLoader__.load({
         ruleLabel: "规则",
         panelTitle: "TTSR 规则 — 本会话",
         panelNote: "开关仅对本会话生效；全局配置不变。静音在重载后保留。",
+        dockButton: "TTSR 规则",
+        noRules: "暂无规则 — 使用 /omfg <描述> 生成。",
         on: "开",
         off: "关",
       },
@@ -120,6 +124,18 @@ window.__ModuleLoader__.load({
       `}`,
       `.${NS}-switch[data-on="true"] .${NS}-switch-knob { left: 20px; }`,
       `.${NS}-switch[disabled] { opacity: 0.5; cursor: wait; }`,
+      `.${NS}-dock { display: flex; align-items: center; gap: 8px; }`,
+      `.${NS}-dock-btn {`,
+      `  border: 1px solid var(--dsw-alias-border-l2);`,
+      `  background: var(--dsw-alias-bg-layer-2);`,
+      `  color: var(--dsw-alias-label-secondary);`,
+      `  border-radius: 999px;`,
+      `  padding: 2px 10px;`,
+      `  font-size: 11px;`,
+      `  cursor: pointer;`,
+      `}`,
+      `.${NS}-dock-btn:hover { color: var(--dsw-alias-label-primary); border-color: var(--dsw-alias-state-warn-primary); }`,
+      `.${NS}-dock .${NS}-panel { position: absolute; bottom: calc(100% + 6px); right: 0; width: min(480px, 90vw); z-index: 30; }`,
     ].join("\n");
 
     function WarningIcon() {
@@ -199,7 +215,7 @@ window.__ModuleLoader__.load({
       );
     }
 
-    const inject = ["uiConversation", "slots", "locale"];
+    const inject = ["uiConversation", "slots", "locale", "remote"];
 
     function apply(ctx) {
       ctx.effect(() => ctx.locale.register(NS, dictionaries), `${NS}: dictionaries`);
@@ -291,25 +307,57 @@ window.__ModuleLoader__.load({
       );
     }
 
-    function TtsrRulePanel(props) {
-      const node = props?.node;
-      const t = props?.t ?? ((key) => dictionaries.en[key] ?? key);
-      const setRule = props?.setRule;
+    // The per-session rule panel lives in the composer dock: a small button
+    // next to the input that opens the toggle panel. It talks to the Host
+    // through the shipped commands Remote (/ttsr fetches state, /ttsr-set flips).
+    function TtsrDockPanel(props, ctxRef) {
+      const ctx = ctxRef.current;
       const sessionId = props?.sessionId;
-      const [rules, setRules] = React.useState(Array.isArray(node?.data?.rules) ? node.data.rules : []);
+      const t = props?.t ?? ((key) => dictionaries.en[key] ?? key);
+      const [open, setOpen] = React.useState(false);
+      const [rules, setRules] = React.useState([]);
       const [busy, setBusy] = React.useState(null);
       const [error, setError] = React.useState(null);
+      const [loading, setLoading] = React.useState(false);
+
+      const runCommand = async (line) => {
+        const remote = ctx?.remote;
+        const execute = remote?.commands?.execute;
+        if (typeof execute !== "function") throw new Error("commands remote is unavailable");
+        const execution = await execute(sessionId, line, [], undefined);
+        return execution?.result?.text ?? execution?.text ?? "";
+      };
+
+      const load = async () => {
+        setLoading(true);
+        setError(null);
+        try {
+          const text = await runCommand("/ttsr");
+          const parsed = parsePanelText(text);
+          if (parsed !== null && Array.isArray(parsed.rules) && parsed.rules.length > 0) setRules(parsed.rules);
+          else if (text.startsWith("TTSR: no rules")) setRules([]);
+          else setError(String(text.slice(0, 120)));
+        } catch (cause) {
+          setError(String(cause?.message ?? cause));
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      React.useEffect(() => {
+        if (open && rules.length === 0 && loading === false) load();
+      }, [open]);
 
       const onToggle = (rule) => {
-        if (busy !== null || typeof setRule !== "function" || sessionId === undefined) return;
+        if (busy !== null || sessionId === undefined) return;
         setBusy(rule.name);
         setError(null);
         setRules((current) => current.map((entry) => (entry.name === rule.name ? { ...entry, muted: !entry.muted } : entry)));
-        Promise.resolve(setRule(sessionId, rule.name, rule.muted))
-          .then((execution) => {
-            const text = execution?.result?.text ?? execution?.text ?? "";
+        runCommand(`/ttsr-set ${rule.name} ${rule.muted ? "on" : "off"}`)
+          .then((text) => {
             const parsed = parsePanelText(text);
             if (parsed !== null && Array.isArray(parsed.rules) && parsed.rules.length > 0) setRules(parsed.rules);
+            else setError(String(text.slice(0, 120)));
           })
           .catch((cause) => {
             setError(String(cause?.message ?? cause));
@@ -318,39 +366,66 @@ window.__ModuleLoader__.load({
           .finally(() => setBusy(null));
       };
 
+      if (sessionId === undefined) return null;
       return h(
-        "section",
-        { className: `${NS}-panel`, "data-ttsr-panel": String(node?.id ?? "") },
+        "div",
+        { className: `${NS}-dock` },
         h("style", null, CARD_CSS),
         h(
-          "div",
-          { className: `${NS}-panel-head` },
-          h("span", { className: `${NS}-panel-title` }, t("panelTitle")),
-          h("span", { className: `${NS}-panel-sub` }, error !== null ? `${t("panelNote")} — ${error}` : t("panelNote")),
+          "button",
+          {
+            className: `${NS}-dock-btn`,
+            "aria-expanded": String(open),
+            onClick: () => {
+              if (!open && rules.length === 0) load();
+              setOpen(!open);
+            },
+          },
+          `⚡ ${t("dockButton")}`,
         ),
-        rules.map((rule) =>
-          h(
-            "div",
-            { key: rule.name, className: `${NS}-panel-row` },
-            h(
+        open
+          ? h(
               "div",
-              { style: { display: "flex", flexDirection: "column", minWidth: 0 } },
-              h("span", { className: `${NS}-panel-name` }, rule.name),
-              typeof rule.trigger === "string" && rule.trigger.length > 0
-                ? h("span", { className: `${NS}-panel-trigger` }, rule.trigger)
-                : null,
-            ),
-            h(RuleSwitch, {
-              on: rule.muted !== true,
-              disabled: busy === rule.name,
-              onToggle: () => onToggle(rule),
-              label: rule.name,
-            }),
-          ),
-        ),
+              { className: `${NS}-panel` },
+              h(
+                "div",
+                { className: `${NS}-panel-head` },
+                h("span", { className: `${NS}-panel-title` }, t("panelTitle")),
+                h(
+                  "span",
+                  { className: `${NS}-panel-sub` },
+                  error !== null ? error : loading ? "…" : t("panelNote"),
+                ),
+              ),
+              rules.length === 0 && loading === false
+                ? h("span", { className: `${NS}-panel-sub` }, t("noRules"))
+                : rules.map((rule) =>
+                    h(
+                      "div",
+                      { key: rule.name, className: `${NS}-panel-row` },
+                      h(
+                        "div",
+                        { style: { display: "flex", flexDirection: "column", minWidth: 0 } },
+                        h("span", { className: `${NS}-panel-name` }, rule.name),
+                        typeof rule.trigger === "string" && rule.trigger.length > 0
+                          ? h("span", { className: `${NS}-panel-trigger` }, rule.trigger)
+                          : null,
+                      ),
+                      h(RuleSwitch, {
+                        on: rule.muted !== true,
+                        disabled: busy === rule.name,
+                        onToggle: () => onToggle(rule),
+                        label: rule.name,
+                      }),
+                    ),
+                  ),
+            )
+          : null,
       );
     }
 
+      // Claim the panel-backend command events (ttsr bare + ttsr-set) as hidden
+      // chat nodes: they render no command rows; the UI lives in the composer dock.
       ctx.uiConversation.events.register({
         kind: PANEL_KIND,
         target: "chat",
@@ -364,56 +439,32 @@ window.__ModuleLoader__.load({
             return null;
           }
           if (event.type === "command/done") {
-            if (parsePanelText(event.data?.text) === null) return null;
+            const text = String(event.data?.text ?? "");
+            if (!text.startsWith(PANEL_PREFIX) && !text.startsWith(SET_PREFIX)) return null;
             return { id: String(event.data.commandId), role: "update", exclusive: true };
           }
           return null;
         },
-        start: (_context, match) => ({ hidden: match.event.data?.name === "ttsr-set", rules: [] }),
-        update: (context, match) => {
-          const parsed = parsePanelText(match.event.data?.text);
-          if (parsed === null || context.state.hidden) return context.state;
-          return { ...context.state, rules: parsed.rules };
-        },
-        buildViewNode: (context) => {
-          if (context.state.hidden) {
-            return {
-              key: context.key,
-              kind: HIDDEN_KIND,
-              id: context.id,
-              target: "chat",
-              anchorSeq: context.start.event.seq,
-              location: context.start.location,
-              visibility: "hidden",
-              data: {},
-            };
-          }
-          if (!Array.isArray(context.state.rules) || context.state.rules.length === 0) return null;
-          return {
-            key: context.key,
-            kind: PANEL_KIND,
-            id: context.id,
-            target: "chat",
-            anchorSeq: context.start.event.seq,
-            location: context.start.location,
-            visibility: "visible",
-            data: { rules: context.state.rules },
-          };
-        },
+        start: () => ({ hidden: true }),
+        update: (context) => context.state,
+        buildViewNode: (context) => ({
+          key: context.key,
+          kind: HIDDEN_KIND,
+          id: context.id,
+          target: "chat",
+          anchorSeq: context.start.event.seq,
+          location: context.start.location,
+          visibility: "hidden",
+          data: {},
+        }),
       });
 
-      ctx.slots.inject("conversation.chat.node", () =>
+      // The rule panel itself: a composer-dock entry (popup beside the input).
+      const ctxRef = { current: ctx };
+      ctx.slots.inject("conversation.composer.dock", () =>
         ctx.slots.register(
-          {
-            name: "conversation.chat.node",
-            key: PANEL_KIND,
-            locale: NS,
-            inject: () => ({
-              setRule: (sessionId, name, muted) =>
-                ctx.remote?.commands?.execute(sessionId, `/ttsr-set ${name} ${muted ? "off" : "on"}`, [], undefined),
-            }),
-          },
-          TtsrRulePanel,
+          { name: "conversation.composer.dock", id: "ttsr-rules", order: 5, label: "TTSR rules" },
+          (props) => TtsrDockPanel(props, ctxRef),
         ),
       );
     }

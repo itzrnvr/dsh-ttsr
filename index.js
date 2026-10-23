@@ -33,7 +33,6 @@ const inject = ["commands", "userQuestions", "sessionProjections", "agents"];
 
 const FAILURE_CODE = "TTSR_INTERRUPT";
 const REMINDER_SOURCE = "dsh-ttsr:reminder";
-const MUTE_SOURCE = "dsh-ttsr:mute";
 const PANEL_PREFIX = "TTSR-PANEL ";
 const SET_PREFIX = "TTSR-SET ";
 const INTERNAL_REQUESTS = new WeakSet();
@@ -284,6 +283,7 @@ function stateOf(sessionId) {
       judgmentBusy: false, // one judge batch at a time per session
       judgmentQueue: [],
       disabled: new Set(), // rule names muted for this session only (config untouched)
+      verifiedNo: new Map(), // rule name -> buffer length at its last not-a-violation verdict
     };
     live.set(sessionId, state);
   }
@@ -336,27 +336,13 @@ function apply(ctx, config = {}) {
     }));
   }
 
-  /** Apply a mute change durably: live state + a log-only marker event. */
+  /** Apply a mute change to live state. Durable state derives from the
+   *  ttsr-set command events themselves (their command/done results carry the
+   *  full rule snapshot); no session events are appended here. Appending
+   *  novel user/message shapes poisons the live session (v4 rejects them). */
   function applyMutes(agent, nextDisabled) {
     const state = stateOf(agent.id);
     state.disabled = nextDisabled;
-    const mutes = {};
-    for (const rule of rules) mutes[rule.name] = nextDisabled.has(rule.name);
-    try {
-      agent.session.append("user/message", {
-        id: randomUUID(),
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: `ttsr session mutes: ${[...nextDisabled].join(", ") || "(none)"}`,
-          },
-        ],
-        source: { kind: MUTE_SOURCE, mutes },
-      });
-    } catch (error) {
-      warnOnce(ctx.logger ?? console, "mute-marker", `could not persist session mutes: ${error.message}`);
-    }
   }
 
   /** Mark a rule injected, recording the turn it fired at for after-gap repeats. */
@@ -456,13 +442,24 @@ function apply(ctx, config = {}) {
       init: () => ({ injectedRules: [], completedTurns: 0, mutes: {} }),
       apply: (state, event) => {
         if (event.type === "turn/end") return { injectedRules: state.injectedRules, completedTurns: state.completedTurns + 1, mutes: state.mutes };
+        if (event.type === "command/done") {
+          // Mute snapshots ride on ttsr-set / panel command results — existing,
+          // legal event types — instead of novel marker events.
+          const text = String(event.data?.text ?? "");
+          if (text.startsWith(SET_PREFIX) || text.startsWith(PANEL_PREFIX)) {
+            try {
+              const parsed = JSON.parse(text.slice(text.indexOf("{")));
+              if (Array.isArray(parsed?.rules)) {
+                const mutes = {};
+                for (const rule of parsed.rules) if (rule !== null && typeof rule.name === "string") mutes[rule.name] = rule.muted === true;
+                return { injectedRules: state.injectedRules, completedTurns: state.completedTurns, mutes };
+              }
+            } catch {}
+          }
+          return state;
+        }
         if (event.type !== "user/message") return state;
         const source = event.data?.source;
-        if (source?.kind === MUTE_SOURCE) {
-          const mutes =
-            source.mutes !== null && typeof source.mutes === "object" && !Array.isArray(source.mutes) ? source.mutes : state.mutes;
-          return { injectedRules: state.injectedRules, completedTurns: state.completedTurns, mutes };
-        }
         if (source?.kind !== REMINDER_SOURCE) return state;
         const names = Array.isArray(source.rules) ? source.rules.filter((entry) => typeof entry === "string") : [];
         if (names.length === 0) return state;
@@ -474,7 +471,7 @@ function apply(ctx, config = {}) {
             changed = true;
           }
         }
-        return changed ? { injectedRules: [...merged], completedTurns: state.completedTurns } : state;
+        return changed ? { injectedRules: [...merged], completedTurns: state.completedTurns, mutes: state.mutes } : state;
       },
     });
   } catch (error) {
@@ -578,6 +575,56 @@ function apply(ctx, config = {}) {
     return true;
   }
 
+  /**
+   * Detection -> decision -> execution: a pattern match pauses the stream and
+   * asks the decision model whether this is the assistant genuinely violating
+   * the rule — as opposed to quoting rule text, discussing rules, or legitimate
+   * technical analysis of the pattern's subject. Only a confirmed violation
+   * interrupts. When no decision model is configured, matches fire directly.
+   */
+  async function verifyViolation(match, entry, source, state, session, sessionId) {
+    if (settings.judge.kind !== "qev") return true;
+    const lastNo = state.verifiedNo.get(match.rule.name) ?? Number.NEGATIVE_INFINITY;
+    if (entry.text.length - lastNo < 512) return false; // recently judged not-a-violation
+    let agent;
+    try {
+      agent = ctx.agents.get(sessionId);
+    } catch {
+      agent = undefined;
+    }
+    const userRequest = agent !== undefined ? lastUserRequest(agent) : null;
+    state.verifiedNo.set(match.rule.name, entry.text.length);
+    try {
+      const baseUrl = await ensureQev();
+      const decisionState = {
+        rule_name: match.rule.name,
+        rule_intent: match.rule.message,
+        pattern: match.rule.condition ?? "",
+        matched_text: match.excerpt ?? "",
+        output_kind: source,
+        output_context: truncateMiddle(entry.text, 3000),
+        user_request: userRequest ?? "(the user's request is not available)",
+      };
+      const answers = await qevDecide(baseUrl, decisionState, {
+        decision: {
+          type: "noul",
+          instructions:
+            "The assistant's output matched the rule's pattern. Is this the assistant itself VIOLATING the rule's intent — not quoting rule/config/log text, not discussing or analyzing rules, and not legitimate technical discussion of the pattern's subject?",
+        },
+      });
+      const noul = answers.decision?.noul;
+      if (typeof noul !== "number") return true; // unparseable verdict: fire
+      if (noul < settings.judge.threshold) {
+        warnOnce(ctx.logger ?? console, "verify", `qev cleared a match of "${match.rule.name}" (noul ${noul.toFixed(2)})`);
+        return false;
+      }
+      return true;
+    } catch (error) {
+      warnOnce(ctx.logger ?? console, "verify", `decision unavailable (${error.message}); firing the match`);
+      return true;
+    }
+  }
+
   ctx.on("llm/stream", (options, next) => {
     if (!settings.enabled || rules.length === 0) return next();
     if (options.purpose !== undefined || options.sessionId === undefined) return next();
@@ -661,10 +708,16 @@ function apply(ctx, config = {}) {
               if (match !== null) {
                 const canInterrupt = interruptAllowed(match.rule, source);
                 if (canInterrupt && !retriesExhausted(state)) {
-                  violation = match;
-                  break monitor;
-                }
-                if (!canInterrupt) {
+                  // Detection -> decision -> execution: the pattern only fires
+                  // when the decision model confirms a genuine violation.
+                  const confirmed = await verifyViolation(match, current, source, state, session, sessionId);
+                  if (confirmed) {
+                    violation = match;
+                    break monitor;
+                  }
+                  // Verdict: do nothing. The match was quoted text, rule
+                  // discussion, or legitimate analysis — the stream continues.
+                } else if (!canInterrupt) {
                   // Non-interrupting match (interruptMode "never", or prose-only/tool-only
                   // out of mode): deliver the reminder without aborting the stream.
                   if (source === "tool" && current.callId !== null) {
@@ -1187,9 +1240,10 @@ async function runTtsr(ctx, settings, rules, helpers, invocation) {
     if (selected === null) return { kind: "success", text: "TTSR: rule panel closed without changes." };
     const next = new Set(selected.filter((label) => rules.some((rule) => rule.name === label)));
     helpers.applyMutes(invocation.agent, next);
-    return next.size === 0
-      ? { kind: "success", text: "TTSR: all rules active in this session." }
-      : { kind: "success", text: `TTSR: disabled for this session (config untouched; everything else active): ${[...next].join(", ")}.` };
+    return {
+      kind: "success",
+      text: `${SET_PREFIX}${JSON.stringify({ rules: helpers.ruleSnapshot(stateOf(invocation.agent.id)) })}`,
+    };
   }
 
   if (command === "set") {
@@ -1206,14 +1260,20 @@ async function runTtsr(ctx, settings, rules, helpers, invocation) {
     if (rest.length === 0) {
       if (command === "off") return { kind: "success", text: "TTSR: /ttsr off needs a rule name, or use /ttsr mute to silence everything." };
       helpers.applyMutes(invocation.agent, new Set());
-      return { kind: "success", text: "TTSR: all rules restored in this session." };
+      return {
+        kind: "success",
+        text: `${SET_PREFIX}${JSON.stringify({ rules: helpers.ruleSnapshot(stateOf(invocation.agent.id)) })}`,
+      };
     }
     return helpers.setSessionRule(invocation, rest, command === "off");
   }
 
   if (command === "mute") {
     helpers.applyMutes(invocation.agent, new Set(rules.map((rule) => rule.name)));
-    return { kind: "success", text: "TTSR: all rules muted in this session (config untouched). /ttsr on <name> to restore." };
+    return {
+      kind: "success",
+      text: `${SET_PREFIX}${JSON.stringify({ rules: helpers.ruleSnapshot(stateOf(invocation.agent.id)) })}`,
+    };
   }
 
   if (command === "enable" || command === "disable") {
