@@ -258,39 +258,41 @@ function reminderMessage(violations, mode = "interrupt") {
 // Plugin
 // ---------------------------------------------------------------------------
 
+// Per-session live state (module scope so the command handlers can reach it).
+// Derived cache; the session log is the truth. Entries are cleaned on agent
+// disposal and re-created on demand.
+const live = new Map();
+
+function stateOf(sessionId) {
+  let state = live.get(sessionId);
+  if (state === undefined) {
+    state = {
+      pending: null, // { nonce, violations } awaiting the request-error retry
+      stepRetries: new Map(), // "turn:step" -> count
+      currentStepKey: "",
+      currentTurn: 0,
+      injected: new Set(), // rule names injected in this process
+      injectedAtTurn: new Map(), // rule name -> turn number at injection
+      passiveTools: new Map(), // `${sessionId}:${callId}` -> reminder message
+      passiveProse: null, // reminder message to steer after a clean finish
+      broken: false, // monitor health for this session
+      astDenies: 0, // AST denials since the last assistant message
+      judged: new Set(), // assistant message ids already judged
+      judgmentBusy: false, // one judge batch at a time per session
+      judgmentQueue: [],
+      disabled: new Set(), // rule names muted for this session only (config untouched)
+    };
+    live.set(sessionId, state);
+  }
+  return state;
+}
+
 function apply(ctx, config = {}) {
   const settings = resolveSettings(config, ctx.logger ?? console);
   const rules = settings.rules;
   const rulesByName = new Map(rules.map((rule) => [rule.name, rule]));
   const astRules = rules.filter((rule) => rule.astItems !== null);
   const questionRules = rules.filter((rule) => rule.question !== undefined);
-
-  // ---- per-session live state (derived cache; the log is the truth) ----
-  const live = new Map();
-
-  function stateOf(sessionId) {
-    let state = live.get(sessionId);
-    if (state === undefined) {
-      state = {
-        pending: null, // { nonce, violations } awaiting the request-error retry
-        stepRetries: new Map(), // "turn:step" -> count
-        currentStepKey: "",
-        currentTurn: 0,
-        injected: new Set(), // rule names injected in this process
-        injectedAtTurn: new Map(), // rule name -> turn number at injection
-        passiveTools: new Map(), // `${sessionId}:${callId}` -> reminder message
-        passiveProse: null, // reminder message to steer after a clean finish
-        broken: false, // monitor health for this session
-        astDenies: 0, // AST denials since the last assistant message
-        judged: new Set(), // assistant message ids already judged
-        judgmentBusy: false, // one judge batch at a time per session
-        judgmentQueue: [],
-        disabled: new Set(), // rule names muted for this session only (config untouched)
-      };
-      live.set(sessionId, state);
-    }
-    return state;
-  }
 
   function readProjection(session) {
     try {
@@ -1057,7 +1059,7 @@ async function runTtsr(ctx, settings, rules, invocation) {
           {
             id: "enabled",
             header: "TTSR rules",
-            question: "Keep which rules active in THIS session? Uncheck to mute for this session only (the global config is not changed).",
+            question: "Keep which rules active in THIS session? CHECK the rules to keep — every UNCHECKED rule is muted for this session only (the global config is not changed). Submit with nothing checked to cancel.",
             options: rules.map((rule) => {
               const trigger =
                 rule.regex !== null ? `/${rule.condition}/` : rule.astItems !== null ? `ast: ${rule.astCondition}` : `judge: ${rule.question.slice(0, 60)}`;
@@ -1085,7 +1087,9 @@ async function runTtsr(ctx, settings, rules, invocation) {
   if (command === "off" || command === "on") {
     if (rest.length === 0) {
       if (command === "off") return { kind: "success", text: "TTSR: /ttsr off needs a rule name, or use /ttsr mute to silence everything." };
-      return { kind: "error", text: "TTSR: /ttsr on needs a rule name (or /ttsr rules to pick from a panel)." };
+      const state = stateOf(invocation.agent.id);
+      state.disabled.clear();
+      return { kind: "success", text: "TTSR: all rules restored in this session." };
     }
     const state = stateOf(invocation.agent.id);
     const target = rules.find((rule) => rule.name === rest) ?? rules.find((rule) => rule.name.startsWith(rest));
