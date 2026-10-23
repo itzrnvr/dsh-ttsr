@@ -800,16 +800,22 @@ function apply(ctx, config = {}) {
     const blocks = Array.isArray(message?.content) ? message.content : [];
     const text = [];
     const reasoning = [];
+    let toolCalls = 0;
     for (const block of blocks) {
       if (block?.type === "text" && typeof block.text === "string") text.push(block.text);
       else if (block?.type === "reasoning" && typeof block.text === "string") reasoning.push(block.text);
       else if (block?.type === "tool-call" && typeof block.arguments === "string") {
+        toolCalls += 1;
         outputs.push({ kind: "tool", toolName: block.name, path: pathFromPartialJson(block.arguments), content: block.arguments });
       }
     }
+    // A message that also dispatches tool calls is acting, not stalling: its
+    // prose is a preamble to work already underway, so only the tool outputs
+    // are judged. Judging the prose alone flags normal transitional narration.
+    const proseIsPreamble = toolCalls > 0;
     const result = [];
-    if (text.length > 0) result.push({ kind: "text", content: text.join("\n") });
-    if (reasoning.length > 0) result.push({ kind: "reasoning", content: reasoning.join("\n") });
+    if (text.length > 0 && !proseIsPreamble) result.push({ kind: "text", content: text.join("\n") });
+    if (reasoning.length > 0 && !proseIsPreamble) result.push({ kind: "reasoning", content: reasoning.join("\n") });
     result.push(...outputs);
     return result;
   }
