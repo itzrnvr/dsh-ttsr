@@ -14,6 +14,11 @@ window.__ModuleLoader__.load({
     const NS = "dsh-ttsr";
     const REMINDER_SOURCE = "dsh-ttsr:reminder";
     const NODE_KIND = "dsh-ttsr-reminder";
+    const PANEL_KIND = "dsh-ttsr-panel";
+    const HIDDEN_KIND = "dsh-ttsr-panel-hidden";
+    const PANEL_PREFIX = "TTSR-PANEL ";
+    const SET_PREFIX = "TTSR-SET ";
+    const PANEL_SUBCOMMANDS = /^\s*(rules|list|set|on|off|mute|test|forget|enable|disable)\b/;
 
     const dictionaries = {
       en: {
@@ -23,6 +28,10 @@ window.__ModuleLoader__.load({
         observeNote: "The output was not interrupted; this reminder was injected for the next step.",
         matched: "matched",
         ruleLabel: "rule",
+        panelTitle: "TTSR rules — this session",
+        panelNote: "Toggles apply to this session only; the global config is untouched. Mutes survive reload.",
+        on: "ON",
+        off: "OFF",
       },
       zh: {
         cardTitle: "已注入流规则",
@@ -31,6 +40,10 @@ window.__ModuleLoader__.load({
         observeNote: "输出未被中断；该提醒已注入供下一步使用。",
         matched: "命中",
         ruleLabel: "规则",
+        panelTitle: "TTSR 规则 — 本会话",
+        panelNote: "开关仅对本会话生效；全局配置不变。静音在重载后保留。",
+        on: "开",
+        off: "关",
       },
     };
 
@@ -64,6 +77,49 @@ window.__ModuleLoader__.load({
       `}`,
       `.${NS}-message { color: var(--dsw-alias-label-primary); font-size: 12.5px; padding-left: 26px; }`,
       `.${NS}-note { color: var(--dsw-alias-label-secondary); font-size: 11.5px; padding-left: 26px; }`,
+      `.${NS}-panel {`,
+      `  border: 1px solid var(--dsw-alias-border-l2);`,
+      `  background: var(--dsw-alias-bg-layer-1);`,
+      `  border-radius: var(--dsw-radius-xl, 12px);`,
+      `  box-shadow: var(--dsw-shadow-lv2, none);`,
+      `  padding: 10px 14px 12px 14px;`,
+      `  margin: 6px 0;`,
+      `  display: flex;`,
+      `  flex-direction: column;`,
+      `  gap: 4px;`,
+      `  max-width: var(--dsh-chat-content-width, 100%);`,
+      `}`,
+      `.${NS}-panel-head { display: flex; flex-direction: column; gap: 2px; padding-bottom: 4px; border-bottom: 1px solid var(--dsw-alias-border-l1); }`,
+      `.${NS}-panel-title { color: var(--dsw-alias-label-primary); font-weight: 600; font-size: 13px; }`,
+      `.${NS}-panel-sub { color: var(--dsw-alias-label-secondary); font-size: 11px; }`,
+      `.${NS}-panel-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 3px 0; }`,
+      `.${NS}-panel-name { color: var(--dsw-alias-label-primary); font-size: 12.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }`,
+      `.${NS}-panel-trigger { color: var(--dsw-alias-label-secondary); font-size: 10.5px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 420px; }`,
+      `.${NS}-switch {`,
+      `  flex: 0 0 auto;`,
+      `  width: 40px;`,
+      `  height: 22px;`,
+      `  border-radius: 11px;`,
+      `  border: 1px solid var(--dsw-alias-border-l2);`,
+      `  background: var(--dsw-alias-bg-layer-2);`,
+      `  position: relative;`,
+      `  cursor: pointer;`,
+      `  padding: 0;`,
+      `  transition: background 120ms ease;`,
+      `}`,
+      `.${NS}-switch[data-on="true"] { background: var(--dsw-alias-state-success-primary); border-color: var(--dsw-alias-state-success-primary); }`,
+      `.${NS}-switch-knob {`,
+      `  position: absolute;`,
+      `  top: 2px;`,
+      `  left: 2px;`,
+      `  width: 16px;`,
+      `  height: 16px;`,
+      `  border-radius: 50%;`,
+      `  background: var(--dsw-alias-label-primary);`,
+      `  transition: left 120ms ease;`,
+      `}`,
+      `.${NS}-switch[data-on="true"] .${NS}-switch-knob { left: 20px; }`,
+      `.${NS}-switch[disabled] { opacity: 0.5; cursor: wait; }`,
     ].join("\n");
 
     function WarningIcon() {
@@ -195,6 +251,169 @@ window.__ModuleLoader__.load({
         ctx.slots.register(
           { name: "conversation.chat.node", key: NODE_KIND, locale: NS },
           TtsrReminderCard,
+        ),
+      );
+
+      // ---- per-session rule panel (live toggle switches) ----------------------
+    function parsePanelText(text) {
+      if (typeof text !== "string") return null;
+      if (text.startsWith(PANEL_PREFIX)) {
+        try {
+          return { hidden: false, rules: JSON.parse(text.slice(PANEL_PREFIX.length)).rules ?? [] };
+        } catch {
+          return null;
+        }
+      }
+      if (text.startsWith(SET_PREFIX)) {
+        try {
+          return { hidden: true, rules: JSON.parse(text.slice(SET_PREFIX.length)).rules ?? [] };
+        } catch {
+          return null;
+        }
+      }
+      return null;
+    }
+
+    function RuleSwitch(props) {
+      const { on, disabled, onToggle, label } = props;
+      return h(
+        "button",
+        {
+          className: `${NS}-switch`,
+          "data-on": String(on),
+          role: "switch",
+          "aria-checked": String(on),
+          "aria-label": label,
+          disabled: disabled === true,
+          onClick: onToggle,
+        },
+        h("span", { className: `${NS}-switch-knob` }),
+      );
+    }
+
+    function TtsrRulePanel(props) {
+      const node = props?.node;
+      const t = props?.t ?? ((key) => dictionaries.en[key] ?? key);
+      const setRule = props?.setRule;
+      const sessionId = props?.sessionId;
+      const [rules, setRules] = React.useState(Array.isArray(node?.data?.rules) ? node.data.rules : []);
+      const [busy, setBusy] = React.useState(null);
+      const [error, setError] = React.useState(null);
+
+      const onToggle = (rule) => {
+        if (busy !== null || typeof setRule !== "function" || sessionId === undefined) return;
+        setBusy(rule.name);
+        setError(null);
+        setRules((current) => current.map((entry) => (entry.name === rule.name ? { ...entry, muted: !entry.muted } : entry)));
+        Promise.resolve(setRule(sessionId, rule.name, rule.muted))
+          .then((execution) => {
+            const text = execution?.result?.text ?? execution?.text ?? "";
+            const parsed = parsePanelText(text);
+            if (parsed !== null && Array.isArray(parsed.rules) && parsed.rules.length > 0) setRules(parsed.rules);
+          })
+          .catch((cause) => {
+            setError(String(cause?.message ?? cause));
+            setRules((current) => current.map((entry) => (entry.name === rule.name ? { ...entry, muted: rule.muted } : entry)));
+          })
+          .finally(() => setBusy(null));
+      };
+
+      return h(
+        "section",
+        { className: `${NS}-panel`, "data-ttsr-panel": String(node?.id ?? "") },
+        h("style", null, CARD_CSS),
+        h(
+          "div",
+          { className: `${NS}-panel-head` },
+          h("span", { className: `${NS}-panel-title` }, t("panelTitle")),
+          h("span", { className: `${NS}-panel-sub` }, error !== null ? `${t("panelNote")} — ${error}` : t("panelNote")),
+        ),
+        rules.map((rule) =>
+          h(
+            "div",
+            { key: rule.name, className: `${NS}-panel-row` },
+            h(
+              "div",
+              { style: { display: "flex", flexDirection: "column", minWidth: 0 } },
+              h("span", { className: `${NS}-panel-name` }, rule.name),
+              typeof rule.trigger === "string" && rule.trigger.length > 0
+                ? h("span", { className: `${NS}-panel-trigger` }, rule.trigger)
+                : null,
+            ),
+            h(RuleSwitch, {
+              on: rule.muted !== true,
+              disabled: busy === rule.name,
+              onToggle: () => onToggle(rule),
+              label: rule.name,
+            }),
+          ),
+        ),
+      );
+    }
+
+      ctx.uiConversation.events.register({
+        kind: PANEL_KIND,
+        target: "chat",
+        match: (event) => {
+          if (event.type === "command/run") {
+            const name = event.data?.name;
+            if (name === "ttsr" && !PANEL_SUBCOMMANDS.test(String(event.data?.args ?? ""))) {
+              return { id: String(event.data.commandId), role: "start", exclusive: true };
+            }
+            if (name === "ttsr-set") return { id: String(event.data.commandId), role: "start", exclusive: true };
+            return null;
+          }
+          if (event.type === "command/done") {
+            if (parsePanelText(event.data?.text) === null) return null;
+            return { id: String(event.data.commandId), role: "update", exclusive: true };
+          }
+          return null;
+        },
+        start: (_context, match) => ({ hidden: match.event.data?.name === "ttsr-set", rules: [] }),
+        update: (context, match) => {
+          const parsed = parsePanelText(match.event.data?.text);
+          if (parsed === null || context.state.hidden) return context.state;
+          return { ...context.state, rules: parsed.rules };
+        },
+        buildViewNode: (context) => {
+          if (context.state.hidden) {
+            return {
+              key: context.key,
+              kind: HIDDEN_KIND,
+              id: context.id,
+              target: "chat",
+              anchorSeq: context.start.event.seq,
+              location: context.start.location,
+              visibility: "hidden",
+              data: {},
+            };
+          }
+          if (!Array.isArray(context.state.rules) || context.state.rules.length === 0) return null;
+          return {
+            key: context.key,
+            kind: PANEL_KIND,
+            id: context.id,
+            target: "chat",
+            anchorSeq: context.start.event.seq,
+            location: context.start.location,
+            visibility: "visible",
+            data: { rules: context.state.rules },
+          };
+        },
+      });
+
+      ctx.slots.inject("conversation.chat.node", () =>
+        ctx.slots.register(
+          {
+            name: "conversation.chat.node",
+            key: PANEL_KIND,
+            locale: NS,
+            inject: () => ({
+              setRule: (sessionId, name, muted) =>
+                ctx.remote?.commands?.execute(sessionId, `/ttsr-set ${name} ${muted ? "off" : "on"}`, [], undefined),
+            }),
+          },
+          TtsrRulePanel,
         ),
       );
     }
