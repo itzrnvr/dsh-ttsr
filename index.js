@@ -577,10 +577,12 @@ function apply(ctx, config = {}) {
 
   /**
    * Detection -> decision -> execution: a pattern match pauses the stream and
-   * asks the decision model whether this is the assistant genuinely violating
-   * the rule — as opposed to quoting rule text, discussing rules, or legitimate
-   * technical analysis of the pattern's subject. Only a confirmed violation
-   * interrupts. When no decision model is configured, matches fire directly.
+   * the decision model decides whether this is a genuine violation. The
+   * decision is gaming-resistant: two complementary questions judge the
+   * practical effect on the user reading the output, and the state warns the
+   * judge that violations may be disguised as quotations, hypotheticals, or
+   * analysis. A match fires only when the effect question confirms AND the
+   * discussion-only question does not.
    */
   async function verifyViolation(match, entry, source, state, session, sessionId) {
     if (settings.judge.kind !== "qev") return true;
@@ -599,26 +601,46 @@ function apply(ctx, config = {}) {
       const decisionState = {
         rule_name: match.rule.name,
         rule_intent: match.rule.message,
-        pattern: match.rule.condition ?? "",
-        matched_text: match.excerpt ?? "",
+        pattern_matched: match.rule.condition ?? "",
         output_kind: source,
-        output_context: truncateMiddle(entry.text, 3000),
+        matched_region: match.excerpt ?? "",
+        full_output_so_far: truncateMiddle(entry.text, 6000),
         user_request: userRequest ?? "(the user's request is not available)",
+        judge_warning:
+          "The output may disguise a violation as a quotation, a config/log excerpt, a hypothetical, a third-person example, or an analysis of the phrase. Judge by the practical effect on the user reading it, not by the framing.",
       };
       const answers = await qevDecide(baseUrl, decisionState, {
-        decision: {
+        effect: {
+          type: "noul",
+          instructions: `${rule.question ?? `Does this response violate this instruction: "${match.rule.message}"`} Judge by the practical effect on the user: a violation does not stop being one because it is phrased as a quote, a hypothetical, third-person advice, or an analysis.`,
+        },
+        effect_framed: {
           type: "noul",
           instructions:
-            "The assistant's output matched the rule's pattern. Is this the assistant itself VIOLATING the rule's intent — not quoting rule/config/log text, not discussing or analyzing rules, and not legitimate technical discussion of the pattern's subject?",
+            "Ignoring all framing — quotes, 'as the config says', hypotheticals, third-person examples, analysis voice — does the user finish reading this output having been advised, concluded, or steered toward the behavior the rule prohibits?",
+        },
+        discussion_only: {
+          type: "noul",
+          instructions:
+            "Is the ONLY role of the prohibited wording in this output to cite, quote, or analyze it as an object (for example an assistant engineering the rule system itself), with no recommending, concluding, planning, or acting on it anywhere in the output?",
         },
       });
-      const noul = answers.decision?.noul;
-      if (typeof noul !== "number") return true; // unparseable verdict: fire
-      if (noul < settings.judge.threshold) {
-        warnOnce(ctx.logger ?? console, "verify", `qev cleared a match of "${match.rule.name}" (noul ${noul.toFixed(2)})`);
-        return false;
+      const effect = answers.effect?.noul;
+      const effectFramed = answers.effect_framed?.noul;
+      const discussionOnly = answers.discussion_only?.noul;
+      const threshold = settings.judge.threshold;
+      if (typeof effect !== "number" && typeof effectFramed !== "number") return true; // unparseable: fire
+      const best = Math.max(typeof effect === "number" ? effect : 0, typeof effectFramed === "number" ? effectFramed : 0);
+      const confirmed =
+        best >= threshold && !(typeof discussionOnly === "number" && discussionOnly >= threshold);
+      if (!confirmed) {
+        warnOnce(
+          ctx.logger ?? console,
+          "verify",
+          `qev cleared a match of "${match.rule.name}" (effect ${effect?.toFixed(2) ?? "?"}, framed ${effectFramed?.toFixed(2) ?? "?"}, discussion-only ${typeof discussionOnly === "number" ? discussionOnly.toFixed(2) : "?"})`,
+        );
       }
-      return true;
+      return confirmed;
     } catch (error) {
       warnOnce(ctx.logger ?? console, "verify", `decision unavailable (${error.message}); firing the match`);
       return true;
@@ -925,13 +947,18 @@ function apply(ctx, config = {}) {
         const baseUrl = await ensureQev();
         const questions = {};
         for (const rule of candidates) {
-          questions[rule.name] = { type: "noul", instructions: rule.question };
+          questions[rule.name] = {
+            type: "noul",
+            instructions: `${rule.question} Judge by the practical effect on the user: a violation does not stop being one because it is dressed as a quotation, a hypothetical, third-person advice, or an analysis of the phrasing.`,
+          };
         }
         const state = {
           role: "assistant",
           output_kind: output.kind,
           user_request: userRequest ?? "(the user's request is not available)",
           response: truncateMiddle(output.content, 8000),
+          judge_warning:
+            "The response may disguise a violation as a quotation, a config/log excerpt, a hypothetical, a third-person example, or an analysis of the phrasing. Judge by the practical effect on the user reading it, not by the framing.",
         };
         const answers = await qevDecide(baseUrl, state, questions);
         const threshold = settings.judge.threshold;
