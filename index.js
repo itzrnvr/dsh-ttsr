@@ -1034,8 +1034,8 @@ function apply(ctx, config = {}) {
 
   ctx.commands.register({
     name: "ttsr",
-    description: "Manage time-traveling stream rules",
-    input: { hint: "[list|rules|on|off <name>|mute|test <regex>|forget <name>]" },
+    description: "Open the TTSR rule panel for this session (check a rule to disable it)",
+    input: { hint: "[rules|list|on|off <name>|mute|test <regex>|forget <name>]" },
     handler: (invocation) => runTtsr(ctx, settings, rules, invocation),
   });
 }
@@ -1049,7 +1049,7 @@ async function runTtsr(ctx, settings, rules, invocation) {
   const command = input.split(/\s+/, 1)[0]?.toLowerCase() ?? "";
   const rest = input.slice(command.length).trim();
 
-  if (command === "rules") {
+  if (command === "" || command === "rules") {
     if (rules.length === 0) return { kind: "success", text: "TTSR: no rules configured. Use /omfg <description> to generate one." };
     const state = stateOf(invocation.agent.id);
     let selected;
@@ -1057,9 +1057,9 @@ async function runTtsr(ctx, settings, rules, invocation) {
       const answer = await ctx.userQuestions.ask({
         questions: [
           {
-            id: "enabled",
+            id: "muted",
             header: "TTSR rules",
-            question: "Keep which rules active in THIS session? CHECK the rules to keep — every UNCHECKED rule is muted for this session only (the global config is not changed). Submit with nothing checked to cancel.",
+            question: "All rules are active by default. CHECK a rule to DISABLE it for this session only (the global config is not changed) — everything left unchecked stays active. Submitting with nothing checked re-enables everything.",
             options: rules.map((rule) => {
               const trigger =
                 rule.regex !== null ? `/${rule.condition}/` : rule.astItems !== null ? `ast: ${rule.astCondition}` : `judge: ${rule.question.slice(0, 60)}`;
@@ -1071,17 +1071,16 @@ async function runTtsr(ctx, settings, rules, invocation) {
         agent: invocation.agent,
         signal: invocation.signal,
       });
-      selected = answer.answers.find((item) => item.id === "enabled")?.selected ?? null;
+      selected = answer.answers.find((item) => item.id === "muted")?.selected ?? null;
     } catch (error) {
       return { kind: "error", text: `TTSR: could not open the rule panel (${error.message}). Use /ttsr off <name> instead.` };
     }
     if (selected === null) return { kind: "success", text: "TTSR: rule panel closed without changes." };
-    if (selected.length === 0) return { kind: "success", text: "TTSR: no changes (empty selection cancels)." };
-    const next = new Set(rules.filter((rule) => !selected.includes(rule.name)).map((rule) => rule.name));
+    const next = new Set(selected.filter((label) => rules.some((rule) => rule.name === label)));
     state.disabled = next;
     return next.size === 0
       ? { kind: "success", text: "TTSR: all rules active in this session." }
-      : { kind: "success", text: `TTSR: muted for this session (config untouched): ${[...next].join(", ")}. Mutes reset when the app restarts.` };
+      : { kind: "success", text: `TTSR: disabled for this session (config untouched; everything else active): ${[...next].join(", ")}. Mutes reset when the app restarts.` };
   }
 
   if (command === "off" || command === "on") {
@@ -1163,8 +1162,8 @@ async function runTtsr(ctx, settings, rules, invocation) {
     };
   }
 
-  if (command !== "" && command !== "list") {
-    return { kind: "error", text: "Usage: /ttsr [list|rules|on|off <name>|mute|test <regex>|forget <name>]" };
+  if (command !== "list") {
+    return { kind: "error", text: "Usage: /ttsr [rules|list|on|off <name>|mute|test <regex>|forget <name>]" };
   }
 
   if (rules.length === 0) {
