@@ -24,8 +24,10 @@ window.__ModuleLoader__.load({
       en: {
         cardTitle: "Stream rule injected",
         observeTitle: "Stream rule matched",
+        softTitle: "Stream rule noted — keep both tracks",
         retryNote: "The violating attempt was discarded and the step was retried with this rule applied.",
         observeNote: "The output was not interrupted; this reminder was injected for the next step.",
+        softNote: "Allowed through with a note: pragmatic work is fine, but it must not be the only focus — keep the full engineering going.",
         matched: "matched",
         ruleLabel: "rule",
         panelTitle: "TTSR rules — this session",
@@ -38,8 +40,10 @@ window.__ModuleLoader__.load({
       zh: {
         cardTitle: "已注入流规则",
         observeTitle: "命中流规则",
+        softTitle: "已记录流规则 — 双线并行",
         retryNote: "违规输出已被丢弃，并在应用该规则后重试了本步骤。",
         observeNote: "输出未被中断；该提醒已注入供下一步使用。",
+        softNote: "已放行并附注：务实工作没问题，但不能只做它 — 全面的工程工作要继续。",
         matched: "命中",
         ruleLabel: "规则",
         panelTitle: "TTSR 规则 — 本会话",
@@ -124,18 +128,56 @@ window.__ModuleLoader__.load({
       `}`,
       `.${NS}-switch[data-on="true"] .${NS}-switch-knob { left: 20px; }`,
       `.${NS}-switch[disabled] { opacity: 0.5; cursor: wait; }`,
-      `.${NS}-dock { display: flex; align-items: center; gap: 8px; }`,
+      // Dock entry: the shipped StatsPill design language (ActivityPill/UsagePill).
+      `.${NS}-dock { display: inline-flex; align-items: center; }`,
       `.${NS}-dock-btn {`,
-      `  border: 1px solid var(--dsw-alias-border-l2);`,
-      `  background: var(--dsw-alias-bg-layer-2);`,
-      `  color: var(--dsw-alias-label-secondary);`,
+      `  display: inline-flex;`,
+      `  align-items: center;`,
+      `  gap: 4px;`,
+      `  height: 24px;`,
+      `  padding: 0 8px;`,
+      `  border: none;`,
       `  border-radius: 999px;`,
-      `  padding: 2px 10px;`,
-      `  font-size: 11px;`,
+      `  corner-shape: round;`,
+      `  font-size: 12px;`,
+      `  line-height: 18px;`,
+      `  color: var(--dsw-alias-label-secondary);`,
+      `  background: var(--dsw-alias-bg-layer-2);`,
       `  cursor: pointer;`,
       `}`,
-      `.${NS}-dock-btn:hover { color: var(--dsw-alias-label-primary); border-color: var(--dsw-alias-state-warn-primary); }`,
-      `.${NS}-dock .${NS}-panel { position: absolute; bottom: calc(100% + 6px); right: 0; width: min(480px, 90vw); z-index: 30; }`,
+      `.${NS}-dock-btn:hover { background: var(--dsw-alias-interactive-bg-hover); }`,
+      `.${NS}-dock-btn[aria-expanded="true"] {`,
+      `  color: var(--dsw-alias-label-primary);`,
+      `  background: var(--dsw-alias-button-ghost-active-fill);`,
+      `  box-shadow: inset 0 0 0 1px var(--dsw-alias-button-ghost-active-border);`,
+      `}`,
+      `.${NS}-dock-btn svg { flex: none; width: 16px; height: 16px; }`,
+      // Panel: the shipped stat-dialog design language.
+      `.${NS}-dock .${NS}-panel {`,
+      `  position: absolute;`,
+      `  bottom: calc(100% + 6px);`,
+      `  right: 0;`,
+      `  z-index: 1100;`,
+      `  box-sizing: border-box;`,
+      `  border-radius: var(--dsw-radius-lg);`,
+      `  background: var(--dsw-specific-menu);`,
+      `  width: max-content;`,
+      `  min-width: min(320px, 100vw - 24px);`,
+      `  max-width: min(480px, 100vw - 24px);`,
+      `  backdrop-filter: var(--dsw-menu-backdrop-filter);`,
+      `  box-shadow: var(--dsw-elevation-prominent);`,
+      `  color: var(--dsw-alias-label-secondary);`,
+      `  border: 0;`,
+      `  padding: 16px;`,
+      `  font-size: 12px;`,
+      `  line-height: 18px;`,
+      `  max-height: min(480px, 60vh);`,
+      `  overflow-y: auto;`,
+      `}`,
+      `.${NS}-panel-head { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }`,
+      `.${NS}-panel-title { color: var(--dsw-alias-label-primary); font-weight: 500; font-size: 12px; display: flex; justify-content: space-between; gap: 16px; }`,
+      `.${NS}-panel-sub { color: var(--dsw-alias-label-tertiary); font-size: 11px; margin-bottom: 8px; }`,
+      `.${NS}-panel-head::after { content: ""; border-top: 0.5px solid var(--dsw-alias-border-l2); margin-bottom: 10px; }`,
     ].join("\n");
 
     function WarningIcon() {
@@ -198,7 +240,11 @@ window.__ModuleLoader__.load({
           "div",
           { className: `${NS}-head` },
           h("span", { className: `${NS}-icon` }, h(WarningIcon)),
-          h("span", { className: `${NS}-title` }, t(observe ? "observeTitle" : "cardTitle")),
+          h(
+            "span",
+            { className: `${NS}-title` },
+            t(observe === "soft" ? "softTitle" : observe ? "observeTitle" : "cardTitle"),
+          ),
         ),
         rules.map((rule, index) =>
           h(
@@ -211,7 +257,7 @@ window.__ModuleLoader__.load({
             rule.message ? h("div", { className: `${NS}-message` }, rule.message) : null,
           ),
         ),
-        h("div", { className: `${NS}-note` }, t(observe ? "observeNote" : "retryNote")),
+        h("div", { className: `${NS}-note` }, t(observe === "soft" ? "softNote" : observe ? "observeNote" : "retryNote")),
       );
     }
 
@@ -247,7 +293,7 @@ window.__ModuleLoader__.load({
             (ruleName) => parsed.find((rule) => rule.name === ruleName) ?? { name: ruleName },
           );
           return {
-            mode: message.source?.mode === "observe" ? "observe" : "interrupt",
+            mode: message.source?.mode === "observe" || message.source?.mode === "soft" ? message.source.mode : "interrupt",
             rules: merged,
           };
         },
@@ -305,6 +351,34 @@ window.__ModuleLoader__.load({
           onClick: onToggle,
         },
         h("span", { className: `${NS}-switch-knob` }),
+      );
+    }
+
+    // 16px outline icon matching the shipped primitives icon style.
+    function TtsrIcon() {
+      return h(
+        "svg",
+        {
+          viewBox: "0 0 16 16",
+          width: 16,
+          height: 16,
+          "aria-hidden": true,
+          style: { display: "inline-flex" },
+        },
+        h("path", {
+          d: "M8 1.5 L14 4.5 V8 C14 11.5 11.3 13.9 8 14.5 C4.7 13.9 2 11.5 2 8 V4.5 Z",
+          fill: "none",
+          stroke: "currentColor",
+          strokeWidth: 1.2,
+          strokeLinejoin: "round",
+        }),
+        h("path", {
+          d: "M8.8 4.5 L6.2 8.5 H8 L7.2 11.5 L9.8 7.5 H8 Z",
+          fill: "none",
+          stroke: "currentColor",
+          strokeWidth: 1.1,
+          strokeLinejoin: "round",
+        }),
       );
     }
 
@@ -370,25 +444,28 @@ window.__ModuleLoader__.load({
 
       if (sessionId === undefined) return null;
       return h(
-        "div",
-        { className: `${NS}-dock` },
+        "span",
+        { className: `${NS}-dock`, "data-composer-stat": "ttsr" },
         h("style", null, CARD_CSS),
         h(
           "button",
           {
             className: `${NS}-dock-btn`,
+            type: "button",
+            "aria-haspopup": "dialog",
             "aria-expanded": String(open),
             onClick: () => {
               if (!open && rules.length === 0) load();
               setOpen(!open);
             },
           },
-          `⚡ ${t("dockButton")}`,
+          h(TtsrIcon),
+          h("span", { className: `${NS}-dock-label` }, t("dockButton")),
         ),
         open
           ? h(
               "div",
-              { className: `${NS}-panel` },
+              { className: `${NS}-panel`, role: "dialog", "aria-label": t("panelTitle") },
               h(
                 "div",
                 { className: `${NS}-panel-head` },

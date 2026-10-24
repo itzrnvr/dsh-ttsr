@@ -185,7 +185,11 @@ function resolveSettings(config, logger) {
   const judge = {
     kind: rawJudge.kind === "qev" ? "qev" : "chat",
     baseUrl: typeof rawJudge.baseUrl === "string" && rawJudge.baseUrl.length > 0 ? rawJudge.baseUrl : "http://127.0.0.1:8790",
-    threshold: Number.isFinite(rawJudge.threshold) && rawJudge.threshold > 0.5 && rawJudge.threshold < 1 ? rawJudge.threshold : 0.7,
+    threshold: Number.isFinite(rawJudge.threshold) && rawJudge.threshold > 0.5 && rawJudge.threshold < 1 ? rawJudge.threshold : 0.6,
+    hardThreshold:
+      Number.isFinite(rawJudge.hardThreshold) && rawJudge.hardThreshold > 0.5 && rawJudge.hardThreshold < 1
+        ? rawJudge.hardThreshold
+        : 0.75,
     launch:
       typeof rawJudge.launch?.command === "string" && rawJudge.launch.command.length > 0
         ? {
@@ -240,7 +244,9 @@ function reminderMessage(violations, mode = "interrupt") {
   const intro =
     mode === "observe"
       ? "A time-traveling stream rule matched while the response was being written. The output was not interrupted; this reminder is injected so the next step complies. Follow every rule below strictly."
-      : "A time-traveling stream rule matched while the previous response was being written. That attempt was discarded; this reminder was spliced in and the step is being retried. Follow every rule below strictly.";
+      : mode === "soft"
+        ? "A stream rule matched with moderate confidence while the previous response was being written. The response was allowed through; this note is injected so BOTH tracks keep going. Pragmatic tuning or interim work is fine, but it must not be the only focus: continue the full engineering work requested alongside it. Follow every rule below while continuing."
+        : "A time-traveling stream rule matched while the previous response was being written. That attempt was discarded; this reminder was spliced in and the step is being retried. Follow every rule below strictly.";
   const text = [intro, "", ...envelopes].join("\n");
   return {
     id: randomUUID(),
@@ -629,18 +635,22 @@ function apply(ctx, config = {}) {
       const effectFramed = answers.effect_framed?.noul;
       const discussionOnly = answers.discussion_only?.noul;
       const threshold = settings.judge.threshold;
-      if (typeof effect !== "number" && typeof effectFramed !== "number") return true; // unparseable: fire
+      const hardThreshold = settings.judge.hardThreshold;
+      if (typeof effect !== "number" && typeof effectFramed !== "number") return "fire"; // unparseable: fire
       const best = Math.max(typeof effect === "number" ? effect : 0, typeof effectFramed === "number" ? effectFramed : 0);
-      const confirmed =
-        best >= threshold && !(typeof discussionOnly === "number" && discussionOnly >= threshold);
-      if (!confirmed) {
+      const gatedByDiscussion = typeof discussionOnly === "number" && discussionOnly >= threshold;
+      let verdict;
+      if (gatedByDiscussion || best < threshold) verdict = "clear";
+      else if (best >= hardThreshold) verdict = "fire";
+      else verdict = "soft";
+      if (verdict !== "fire") {
         warnOnce(
           ctx.logger ?? console,
           "verify",
-          `qev cleared a match of "${match.rule.name}" (effect ${effect?.toFixed(2) ?? "?"}, framed ${effectFramed?.toFixed(2) ?? "?"}, discussion-only ${typeof discussionOnly === "number" ? discussionOnly.toFixed(2) : "?"})`,
+          `qev ${verdict}ed a match of "${match.rule.name}" (effect ${effect?.toFixed(2) ?? "?"}, framed ${effectFramed?.toFixed(2) ?? "?"}, discussion-only ${typeof discussionOnly === "number" ? discussionOnly.toFixed(2) : "?"})`,
         );
       }
-      return confirmed;
+      return verdict;
     } catch (error) {
       warnOnce(ctx.logger ?? console, "verify", `decision unavailable (${error.message}); firing the match`);
       return true;
@@ -679,6 +689,7 @@ function apply(ctx, config = {}) {
     async function* run() {
       let violation = null;
       let passiveProseViolation = null;
+      let softViolation = null;
       monitor: for await (const chunk of next()) {
         if (!state.broken) {
           try {
@@ -703,8 +714,12 @@ function apply(ctx, config = {}) {
                 if (current.path === null) current.path = pathFromPartialJson(block.arguments);
               }
             } else if (chunk.type === "finish") {
-              // Clean finish: deliver a deferred prose reminder for observe-only rules.
-              if (passiveProseViolation !== null) {
+              // Clean finish: deliver deferred reminders for observe-only rules
+              // and gray-band (soft) verdicts.
+              const deferred = [];
+              if (passiveProseViolation !== null) deferred.push([passiveProseViolation, "observe"]);
+              if (softViolation !== null) deferred.push([softViolation, "soft"]);
+              if (deferred.length > 0) {
                 const agent = (() => {
                   try {
                     return ctx.agents.get(sessionId);
@@ -713,10 +728,12 @@ function apply(ctx, config = {}) {
                   }
                 })();
                 if (agent !== undefined) {
-                  try {
-                    agent.steer(reminderMessage([passiveProseViolation], "observe"));
-                  } catch (error) {
-                    warnOnce(ctx.logger ?? console, "steer", `passive reminder failed: ${error.message}`);
+                  for (const [deferredMatch, mode] of deferred) {
+                    try {
+                      agent.steer(reminderMessage([deferredMatch], mode));
+                    } catch (error) {
+                      warnOnce(ctx.logger ?? console, "steer", `deferred reminder failed: ${error.message}`);
+                    }
                   }
                 }
               }
@@ -732,13 +749,19 @@ function apply(ctx, config = {}) {
                 if (canInterrupt && !retriesExhausted(state)) {
                   // Detection -> decision -> execution: the pattern only fires
                   // when the decision model confirms a genuine violation.
-                  const confirmed = await verifyViolation(match, current, source, state, session, sessionId);
-                  if (confirmed) {
+                  const verdict = await verifyViolation(match, current, source, state, session, sessionId);
+                  if (verdict === "fire") {
                     violation = match;
                     break monitor;
                   }
-                  // Verdict: do nothing. The match was quoted text, rule
-                  // discussion, or legitimate analysis — the stream continues.
+                  if (verdict === "soft") {
+                    // Gray band: the output is allowed through, but a note is
+                    // delivered so both tracks keep going — pragmatic work is
+                    // fine, it must not be the only focus.
+                    softViolation = match;
+                  }
+                  // "clear": quoted text, rule discussion, or legitimate
+                  // analysis — the stream continues with nothing delivered.
                 } else if (!canInterrupt) {
                   // Non-interrupting match (interruptMode "never", or prose-only/tool-only
                   // out of mode): deliver the reminder without aborting the stream.
