@@ -460,6 +460,35 @@ window.__ModuleLoader__.load({
       const [settings, setSettings] = React.useState(null);
       const [saving, setSaving] = React.useState(false);
       const [pingState, setPingState] = React.useState(null);
+      const rootRef = React.useRef(null);
+
+      const closePanel = () => {
+        setOpen(false);
+        setSettingsOpen(false);
+      };
+
+      React.useEffect(() => {
+        if (!open) return;
+        const onPointerDown = (event) => {
+          const root = rootRef.current;
+          if (root !== null && event.target instanceof Node && !root.contains(event.target)) {
+            setOpen(false);
+            setSettingsOpen(false);
+          }
+        };
+        const onKeyDown = (event) => {
+          if (event.key === "Escape") {
+            setOpen(false);
+            setSettingsOpen(false);
+          }
+        };
+        document.addEventListener("pointerdown", onPointerDown, true);
+        document.addEventListener("keydown", onKeyDown, true);
+        return () => {
+          document.removeEventListener("pointerdown", onPointerDown, true);
+          document.removeEventListener("keydown", onKeyDown, true);
+        };
+      }, [open]);
 
       const runCommand = async (line) => {
         const remote = ctx?.remote;
@@ -746,7 +775,7 @@ window.__ModuleLoader__.load({
       const disabledCount = rules.filter((rule) => rule.muted === true).length;
       return h(
         "span",
-        { className: `${NS}-dock`, "data-composer-stat": "ttsr" },
+        { className: `${NS}-dock`, "data-composer-stat": "ttsr", ref: rootRef },
         h("style", null, CARD_CSS),
         h(
           "button",
@@ -757,7 +786,8 @@ window.__ModuleLoader__.load({
             "aria-expanded": String(open),
             onClick: () => {
               if (!open && rules.length === 0) load();
-              setOpen(!open);
+              if (open) closePanel();
+              else setOpen(true);
             },
           },
           h(TtsrIcon),
@@ -787,13 +817,16 @@ window.__ModuleLoader__.load({
                     h(
                       "svg",
                       { width: 14, height: 14, viewBox: "0 0 16 16", fill: "none", "aria-hidden": true },
-                      h("circle", { cx: 8, cy: 8, r: 2.2, stroke: "currentColor", strokeWidth: 1.1 }),
+                      // Sliders/controls mark — reads as settings, not a theme toggle.
                       h("path", {
-                        d: "M8 1.6v1.6M8 12.8v1.6M1.6 8h1.6M12.8 8h1.6M3.5 3.5l1.1 1.1M11.4 11.4l1.1 1.1M12.5 3.5l-1.1 1.1M4.6 11.4l-1.1 1.1",
+                        d: "M2 4.5h1.9M6.9 4.5h7.1M2 8h6.5M12.1 8h1.9M2 11.5h8.1M13.7 11.5h0.3",
                         stroke: "currentColor",
                         strokeWidth: 1.1,
                         strokeLinecap: "round",
                       }),
+                      h("circle", { cx: 5.4, cy: 4.5, r: 1.6, stroke: "currentColor", strokeWidth: 1.1 }),
+                      h("circle", { cx: 10.6, cy: 8, r: 1.6, stroke: "currentColor", strokeWidth: 1.1 }),
+                      h("circle", { cx: 11.9, cy: 11.5, r: 1.6, stroke: "currentColor", strokeWidth: 1.1 }),
                     ),
                   ),
                 ),
