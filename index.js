@@ -1317,9 +1317,16 @@ function apply(ctx, config = {}) {
         let reachable = false;
         let detail = "unreachable";
         try {
-          const response = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(2500) });
-          reachable = response.ok;
-          detail = reachable ? "reachable" : `HTTP ${response.status}`;
+          // Mirror the judge path: bring the configured local server up first.
+          if (settings.judge.kind === "qev" && settings.judge.launch !== undefined) {
+            await ensureQev();
+          }
+          reachable = await qevHealthy(baseUrl);
+          detail = reachable
+            ? settings.judge.launch !== undefined
+              ? "reachable (local model up)"
+              : "reachable (external server)"
+            : "unreachable";
         } catch (error) {
           detail = error.message;
         }
