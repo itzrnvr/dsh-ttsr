@@ -18,6 +18,7 @@ window.__ModuleLoader__.load({
     const HIDDEN_KIND = "dsh-ttsr-panel-hidden";
     const PANEL_PREFIX = "TTSR-PANEL ";
     const SET_PREFIX = "TTSR-SET ";
+    const CONFIG_PREFIX = "TTSR-CFG ";
     const PANEL_SUBCOMMANDS = /^\s*(rules|list|set|on|off|mute|test|forget|enable|disable)\b/;
 
     const dictionaries = {
@@ -36,6 +37,25 @@ window.__ModuleLoader__.load({
         noRules: "No rules configured — use /omfg <description>.",
         on: "ON",
         off: "OFF",
+        toggleAll: "All rules",
+        disabledSuffix: "disabled",
+        settingsTitle: "TTSR settings",
+        settingsHint: "qev is LabQoat's local open-weights decision model speaking the System One protocol that TypeSafe's jev uses; the thresholds below drive the detection → decision → execution gate.",
+        fieldModel: "Decision model",
+        fieldModelExternal: "external server",
+        fieldKind: "Judge",
+        fieldBaseUrl: "Server URL",
+        fieldThreshold: "Threshold (soft)",
+        fieldHardThreshold: "Threshold (hard)",
+        fieldMaxRetries: "Max retries / step",
+        fieldRetryDelay: "Retry delay (ms)",
+        fieldMonitorSubagents: "Monitor subagents",
+        fieldEnabled: "TTSR enabled",
+        save: "Save",
+        testQev: "Test qev",
+        reachable: "qev reachable",
+        unreachable: "qev unreachable",
+        saved: "Saved",
       },
       zh: {
         cardTitle: "已注入流规则",
@@ -52,6 +72,25 @@ window.__ModuleLoader__.load({
         noRules: "暂无规则 — 使用 /omfg <描述> 生成。",
         on: "开",
         off: "关",
+        toggleAll: "全部规则",
+        disabledSuffix: "已禁用",
+        settingsTitle: "TTSR 设置",
+        settingsHint: "qev 是 LabQoat 的本地开源决策模型，遵循 TypeSafe jev 使用的 System One 协议；下方阈值驱动 检测 → 决策 → 执行 门控。",
+        fieldModel: "决策模型",
+        fieldModelExternal: "外部服务",
+        fieldKind: "判定器",
+        fieldBaseUrl: "服务地址",
+        fieldThreshold: "阈值（软）",
+        fieldHardThreshold: "阈值（硬）",
+        fieldMaxRetries: "每步最大重试",
+        fieldRetryDelay: "重试延迟（毫秒）",
+        fieldMonitorSubagents: "监控子代理",
+        fieldEnabled: "启用 TTSR",
+        save: "保存",
+        testQev: "测试 qev",
+        reachable: "qev 可达",
+        unreachable: "qev 不可达",
+        saved: "已保存",
       },
     };
 
@@ -103,6 +142,23 @@ window.__ModuleLoader__.load({
       `.${NS}-panel-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 3px 0; }`,
       `.${NS}-panel-name { color: var(--dsw-alias-label-primary); font-size: 12.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }`,
       `.${NS}-panel-trigger { color: var(--dsw-alias-label-secondary); font-size: 10.5px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 420px; }`,
+      `.${NS}-panel-master { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 0 8px; border-bottom: 0.5px solid var(--dsw-alias-border-l2); margin-bottom: 6px; }`,
+      `.${NS}-panel-master-label { color: var(--dsw-alias-label-primary); font-size: 12px; font-weight: 600; }`,
+      `.${NS}-panel-count { color: var(--dsw-alias-label-tertiary); font-size: 10.5px; }`,
+      `.${NS}-gear { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border: none; background: transparent; color: var(--dsw-alias-label-tertiary); border-radius: var(--dsw-radius-sm); cursor: pointer; padding: 0; flex: 0 0 auto; }`,
+      `.${NS}-gear:hover, .${NS}-gear[aria-pressed="true"] { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }`,
+      `.${NS}-field { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 0; }`,
+      `.${NS}-field-label { color: var(--dsw-alias-label-secondary); font-size: 11.5px; }`,
+      `.${NS}-input, .${NS}-select { box-sizing: border-box; font: inherit; font-size: 11.5px; color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-layer-2); border: 0.5px solid var(--dsw-alias-border-l2); border-radius: var(--dsw-radius-sm); padding: 3px 6px; width: 180px; }`,
+      `.${NS}-input:focus-visible, .${NS}-select:focus-visible { outline: 1px solid var(--dsw-alias-state-business-primary); outline-offset: 1px; }`,
+      `.${NS}-input:disabled { opacity: 0.6; }`,
+      `.${NS}-actions { display: flex; gap: 8px; align-items: center; padding-top: 8px; }`,
+      `.${NS}-btn { font: inherit; font-size: 11.5px; padding: 3px 10px; border-radius: var(--dsw-radius-sm); border: 0.5px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); cursor: pointer; }`,
+      `.${NS}-btn:hover { background: var(--dsw-alias-interactive-bg-hover); }`,
+      `.${NS}-btn[disabled] { opacity: 0.5; cursor: wait; }`,
+      `.${NS}-status { font-size: 10.5px; color: var(--dsw-alias-label-tertiary); }`,
+      `.${NS}-status[data-ok="true"] { color: var(--dsw-alias-state-success-primary); }`,
+      `.${NS}-hint { font-size: 10px; color: var(--dsw-alias-label-tertiary); padding: 2px 0 6px; }`,
       `.${NS}-switch {`,
       `  flex: 0 0 auto;`,
       `  width: 40px;`,
@@ -389,7 +445,8 @@ window.__ModuleLoader__.load({
 
     // The per-session rule panel lives in the composer dock: a small button
     // next to the input that opens the toggle panel. It talks to the Host
-    // through the shipped commands Remote (/ttsr fetches state, /ttsr-set flips).
+    // through the shipped commands Remote (/ttsr fetches state, /ttsr-set flips,
+    // /ttsr-cfg reads and writes the settings).
     function TtsrDockPanel(props, ctxRef) {
       const ctx = ctxRef.current;
       const sessionId = props?.sessionId;
@@ -399,6 +456,10 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(null);
       const [error, setError] = React.useState(null);
       const [loading, setLoading] = React.useState(false);
+      const [settingsOpen, setSettingsOpen] = React.useState(false);
+      const [settings, setSettings] = React.useState(null);
+      const [saving, setSaving] = React.useState(false);
+      const [pingState, setPingState] = React.useState(null);
 
       const runCommand = async (line) => {
         const remote = ctx?.remote;
@@ -425,9 +486,46 @@ window.__ModuleLoader__.load({
         }
       };
 
+      const loadSettings = async () => {
+        setError(null);
+        try {
+          const text = await runCommand("/ttsr-cfg get");
+          if (!text.startsWith(CONFIG_PREFIX)) {
+            setError(String(text.slice(0, 120)));
+            return;
+          }
+          const snapshot = JSON.parse(text.slice(CONFIG_PREFIX.length));
+          setSettings({
+            enabled: snapshot.enabled === true,
+            monitorSubagents: snapshot.monitorSubagents === true,
+            maxRetriesPerStep: String(snapshot.maxRetriesPerStep ?? 2),
+            retryDelayMs: String(snapshot.retryDelayMs ?? 300),
+            model: typeof snapshot.model === "string" ? snapshot.model : null,
+            judge: {
+              kind: snapshot.judge?.kind === "chat" ? "chat" : "qev",
+              baseUrl: String(snapshot.judge?.baseUrl ?? ""),
+              threshold: String(snapshot.judge?.threshold ?? 0.6),
+              hardThreshold: String(snapshot.judge?.hardThreshold ?? 0.75),
+            },
+          });
+        } catch (cause) {
+          setError(String(cause?.message ?? cause));
+        }
+      };
+
       React.useEffect(() => {
         if (open && rules.length === 0 && loading === false) load();
       }, [open]);
+
+      const applyRulePayload = (text) => {
+        const parsed = parsePanelText(text);
+        if (parsed !== null && Array.isArray(parsed.rules) && parsed.rules.length > 0) {
+          setRules(parsed.rules);
+          return true;
+        }
+        setError(String(text.slice(0, 140)));
+        return false;
+      };
 
       const onToggle = (rule) => {
         if (busy !== null || sessionId === undefined) return;
@@ -436,9 +534,7 @@ window.__ModuleLoader__.load({
         setRules((current) => current.map((entry) => (entry.name === rule.name ? { ...entry, muted: !entry.muted } : entry)));
         runCommand(`/ttsr-set ${rule.name} ${rule.muted ? "on" : "off"}`)
           .then((text) => {
-            const parsed = parsePanelText(text);
-            if (parsed !== null && Array.isArray(parsed.rules) && parsed.rules.length > 0) setRules(parsed.rules);
-            else setError(String(text.slice(0, 120)));
+            applyRulePayload(text);
           })
           .catch((cause) => {
             setError(String(cause?.message ?? cause));
@@ -447,7 +543,207 @@ window.__ModuleLoader__.load({
           .finally(() => setBusy(null));
       };
 
+      const allMuted = rules.length > 0 && rules.every((rule) => rule.muted === true);
+      const onToggleAll = () => {
+        if (busy !== null || sessionId === undefined || rules.length === 0) return;
+        setBusy("__all__");
+        setError(null);
+        setRules((current) => current.map((entry) => ({ ...entry, muted: !allMuted })));
+        runCommand(allMuted ? "/ttsr on" : "/ttsr mute")
+          .then((text) => {
+            applyRulePayload(text);
+          })
+          .catch((cause) => {
+            setError(String(cause?.message ?? cause));
+            setRules((current) => current.map((entry) => ({ ...entry, muted: allMuted })));
+          })
+          .finally(() => setBusy(null));
+      };
+
+      const updateSettings = (path, value) => {
+        setSettings((current) => {
+          if (current === null) return current;
+          if (path.startsWith("judge.")) {
+            return { ...current, judge: { ...current.judge, [path.slice(6)]: value } };
+          }
+          return { ...current, [path]: value };
+        });
+      };
+
+      const onSaveSettings = () => {
+        if (settings === null || saving) return;
+        setSaving(true);
+        setError(null);
+        setPingState(null);
+        const patch = {
+          enabled: settings.enabled === true,
+          monitorSubagents: settings.monitorSubagents === true,
+          maxRetriesPerStep: Number(settings.maxRetriesPerStep),
+          retryDelayMs: Number(settings.retryDelayMs),
+          judge: {
+            kind: settings.judge.kind,
+            baseUrl: settings.judge.baseUrl,
+            threshold: Number(settings.judge.threshold),
+            hardThreshold: Number(settings.judge.hardThreshold),
+          },
+        };
+        runCommand(`/ttsr-cfg write ${JSON.stringify(patch)}`)
+          .then((text) => {
+            if (text.startsWith(CONFIG_PREFIX)) {
+              const snapshot = JSON.parse(text.slice(CONFIG_PREFIX.length));
+              setPingState({ detail: snapshot.saved === true ? t("saved") : "", ok: snapshot.saved === true });
+            } else {
+              setError(String(text.slice(0, 140)));
+            }
+          })
+          .catch((cause) => setError(String(cause?.message ?? cause)))
+          .finally(() => setSaving(false));
+      };
+
+      const onPing = () => {
+        if (sessionId === undefined) return;
+        setPingState({ detail: "…", ok: false });
+        runCommand("/ttsr-cfg ping")
+          .then((text) => {
+            if (!text.startsWith(CONFIG_PREFIX)) {
+              setPingState({ detail: String(text.slice(0, 100)), ok: false });
+              return;
+            }
+            const payload = JSON.parse(text.slice(CONFIG_PREFIX.length));
+            setPingState({
+              detail: payload.ping?.reachable === true ? `${t("reachable")} (${payload.ping.baseUrl})` : `${t("unreachable")}: ${payload.ping?.detail ?? "?"}`,
+              ok: payload.ping?.reachable === true,
+            });
+          })
+          .catch((cause) => setPingState({ detail: String(cause?.message ?? cause), ok: false }));
+      };
+
+      const openSettings = () => {
+        const next = !settingsOpen;
+        setSettingsOpen(next);
+        if (next && settings === null) loadSettings();
+      };
+
+      const field = (label, control) =>
+        h(
+          "div",
+          { className: `${NS}-field` },
+          h("span", { className: `${NS}-field-label` }, label),
+          control,
+        );
+
+      const renderSettings = () =>
+        h(
+          "div",
+          null,
+          h("div", { className: `${NS}-hint` }, t("settingsHint")),
+          field(
+            t("fieldModel"),
+            h("span", { className: `${NS}-status` }, settings?.model ?? t("fieldModelExternal")),
+          ),
+          field(
+            t("fieldKind"),
+            h(
+              "select",
+              {
+                className: `${NS}-select`,
+                value: settings?.judge.kind ?? "qev",
+                onChange: (event) => updateSettings("judge.kind", event.target.value),
+              },
+              h("option", { value: "qev" }, "qev (local)"),
+              h("option", { value: "chat" }, "chat (LLM)"),
+            ),
+          ),
+          field(
+            t("fieldBaseUrl"),
+            h("input", {
+              className: `${NS}-input`,
+              type: "text",
+              value: settings?.judge.baseUrl ?? "",
+              onChange: (event) => updateSettings("judge.baseUrl", event.target.value),
+            }),
+          ),
+          field(
+            t("fieldThreshold"),
+            h("input", {
+              className: `${NS}-input`,
+              type: "number",
+              step: "0.05",
+              min: "0.5",
+              max: "0.95",
+              value: settings?.judge.threshold ?? "",
+              onChange: (event) => updateSettings("judge.threshold", event.target.value),
+            }),
+          ),
+          field(
+            t("fieldHardThreshold"),
+            h("input", {
+              className: `${NS}-input`,
+              type: "number",
+              step: "0.05",
+              min: "0.5",
+              max: "0.99",
+              value: settings?.judge.hardThreshold ?? "",
+              onChange: (event) => updateSettings("judge.hardThreshold", event.target.value),
+            }),
+          ),
+          field(
+            t("fieldMaxRetries"),
+            h("input", {
+              className: `${NS}-input`,
+              type: "number",
+              step: "1",
+              min: "0",
+              max: "10",
+              value: settings?.maxRetriesPerStep ?? "",
+              onChange: (event) => updateSettings("maxRetriesPerStep", event.target.value),
+            }),
+          ),
+          field(
+            t("fieldRetryDelay"),
+            h("input", {
+              className: `${NS}-input`,
+              type: "number",
+              step: "100",
+              min: "0",
+              max: "30000",
+              value: settings?.retryDelayMs ?? "",
+              onChange: (event) => updateSettings("retryDelayMs", event.target.value),
+            }),
+          ),
+          field(
+            t("fieldMonitorSubagents"),
+            h(RuleSwitch, {
+              on: settings?.monitorSubagents === true,
+              onToggle: () => updateSettings("monitorSubagents", !(settings?.monitorSubagents === true)),
+              label: t("fieldMonitorSubagents"),
+            }),
+          ),
+          field(
+            t("fieldEnabled"),
+            h(RuleSwitch, {
+              on: settings?.enabled === true,
+              onToggle: () => updateSettings("enabled", !(settings?.enabled === true)),
+              label: t("fieldEnabled"),
+            }),
+          ),
+          h(
+            "div",
+            { className: `${NS}-actions` },
+            h(
+              "button",
+              { className: `${NS}-btn`, type: "button", disabled: saving || settings === null, onClick: onSaveSettings },
+              saving ? "…" : t("save"),
+            ),
+            h("button", { className: `${NS}-btn`, type: "button", onClick: onPing }, t("testQev")),
+            pingState !== null
+              ? h("span", { className: `${NS}-status`, "data-ok": String(pingState.ok === true) }, pingState.detail)
+              : null,
+          ),
+        );
+
       if (sessionId === undefined) return null;
+      const disabledCount = rules.filter((rule) => rule.muted === true).length;
       return h(
         "span",
         { className: `${NS}-dock`, "data-composer-stat": "ttsr" },
@@ -474,34 +770,88 @@ window.__ModuleLoader__.load({
               h(
                 "div",
                 { className: `${NS}-panel-head` },
-                h("span", { className: `${NS}-panel-title` }, t("panelTitle")),
+                h(
+                  "div",
+                  { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 } },
+                  h("span", { className: `${NS}-panel-title` }, settingsOpen ? t("settingsTitle") : t("panelTitle")),
+                  h(
+                    "button",
+                    {
+                      className: `${NS}-gear`,
+                      type: "button",
+                      "aria-pressed": String(settingsOpen),
+                      "aria-label": t("settingsTitle"),
+                      title: t("settingsTitle"),
+                      onClick: openSettings,
+                    },
+                    h(
+                      "svg",
+                      { width: 14, height: 14, viewBox: "0 0 16 16", fill: "none", "aria-hidden": true },
+                      h("circle", { cx: 8, cy: 8, r: 2.2, stroke: "currentColor", strokeWidth: 1.1 }),
+                      h("path", {
+                        d: "M8 1.6v1.6M8 12.8v1.6M1.6 8h1.6M12.8 8h1.6M3.5 3.5l1.1 1.1M11.4 11.4l1.1 1.1M12.5 3.5l-1.1 1.1M4.6 11.4l-1.1 1.1",
+                        stroke: "currentColor",
+                        strokeWidth: 1.1,
+                        strokeLinecap: "round",
+                      }),
+                    ),
+                  ),
+                ),
                 h(
                   "span",
                   { className: `${NS}-panel-sub` },
-                  error !== null ? error : loading ? "…" : t("panelNote"),
+                  error !== null ? error : loading ? "…" : settingsOpen ? t("settingsHint") : t("panelNote"),
                 ),
               ),
-              rules.length === 0 && loading === false
-                ? h("span", { className: `${NS}-panel-sub` }, t("noRules"))
-                : rules.map((rule) =>
-                    h(
-                      "div",
-                      { key: rule.name, className: `${NS}-panel-row` },
-                      h(
-                        "div",
-                        { style: { display: "flex", flexDirection: "column", minWidth: 0 } },
-                        h("span", { className: `${NS}-panel-name` }, rule.name),
-                        typeof rule.trigger === "string" && rule.trigger.length > 0
-                          ? h("span", { className: `${NS}-panel-trigger` }, rule.trigger)
-                          : null,
-                      ),
-                      h(RuleSwitch, {
-                        on: rule.muted !== true,
-                        disabled: busy === rule.name,
-                        onToggle: () => onToggle(rule),
-                        label: rule.name,
-                      }),
-                    ),
+              settingsOpen
+                ? renderSettings()
+                : h(
+                    "div",
+                    null,
+                    rules.length > 0
+                      ? h(
+                          "div",
+                          { className: `${NS}-panel-master` },
+                          h(
+                            "div",
+                            { style: { display: "flex", flexDirection: "column", minWidth: 0 } },
+                            h("span", { className: `${NS}-panel-master-label` }, t("toggleAll")),
+                            h(
+                              "span",
+                              { className: `${NS}-panel-count` },
+                              `${disabledCount}/${rules.length} ${t("disabledSuffix")}`,
+                            ),
+                          ),
+                          h(RuleSwitch, {
+                            on: !allMuted,
+                            disabled: busy === "__all__",
+                            onToggle: onToggleAll,
+                            label: t("toggleAll"),
+                          }),
+                        )
+                      : null,
+                    rules.length === 0 && loading === false
+                      ? h("span", { className: `${NS}-panel-sub` }, t("noRules"))
+                      : rules.map((rule) =>
+                          h(
+                            "div",
+                            { key: rule.name, className: `${NS}-panel-row` },
+                            h(
+                              "div",
+                              { style: { display: "flex", flexDirection: "column", minWidth: 0 } },
+                              h("span", { className: `${NS}-panel-name` }, rule.name),
+                              typeof rule.trigger === "string" && rule.trigger.length > 0
+                                ? h("span", { className: `${NS}-panel-trigger` }, rule.trigger)
+                                : null,
+                            ),
+                            h(RuleSwitch, {
+                              on: rule.muted !== true,
+                              disabled: busy === rule.name || busy === "__all__",
+                              onToggle: () => onToggle(rule),
+                              label: rule.name,
+                            }),
+                          ),
+                        ),
                   ),
             )
           : null,

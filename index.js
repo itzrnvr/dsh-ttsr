@@ -35,6 +35,7 @@ const FAILURE_CODE = "TTSR_INTERRUPT";
 const REMINDER_SOURCE = "dsh-ttsr:reminder";
 const PANEL_PREFIX = "TTSR-PANEL ";
 const SET_PREFIX = "TTSR-SET ";
+const CONFIG_PREFIX = "TTSR-CFG ";
 const INTERNAL_REQUESTS = new WeakSet();
 const FULL_SCAN_LIMIT = 4096;
 const SCOPE_VALUES = ["text", "reasoning", "tool"];
@@ -1239,6 +1240,117 @@ function apply(ctx, config = {}) {
         return { kind: "error", text: "Usage: /ttsr-set <rule-name> on|off" };
       }
       return setSessionRule(invocation, name, value === "off");
+    },
+  });
+
+  /** The judge/decision model file, when the config spawns a local server. */
+  function judgeModelName() {
+    const args = settings.judge.launch?.args;
+    if (!Array.isArray(args)) return null;
+    for (const arg of args) {
+      if (typeof arg === "string" && arg.toLowerCase().endsWith(".gguf")) {
+        const parts = arg.split(/[\\/]/);
+        return parts[parts.length - 1] ?? null;
+      }
+    }
+    return null;
+  }
+
+  /** Readable snapshot of the plugin configuration for the settings panel. */
+  function configSnapshot() {
+    return {
+      enabled: settings.enabled,
+      monitorSubagents: settings.monitorSubagents,
+      maxRetriesPerStep: settings.maxRetriesPerStep,
+      retryDelayMs: settings.retryDelayMs,
+      judge: {
+        kind: settings.judge.kind,
+        baseUrl: settings.judge.baseUrl,
+        threshold: settings.judge.threshold,
+        hardThreshold: settings.judge.hardThreshold,
+      },
+      model: judgeModelName(),
+      ruleCount: rules.length,
+    };
+  }
+
+  /** Merge a settings patch into the stored config without touching the rules. */
+  function mergeSettingsPatch(current, patch) {
+    const next = current !== null && typeof current === "object" ? { ...current } : {};
+    if (typeof patch.enabled === "boolean") next.enabled = patch.enabled;
+    if (typeof patch.monitorSubagents === "boolean") next.monitorSubagents = patch.monitorSubagents;
+    if (Number.isFinite(patch.maxRetriesPerStep)) {
+      next.maxRetriesPerStep = Math.max(0, Math.min(10, Math.trunc(patch.maxRetriesPerStep)));
+    }
+    if (Number.isFinite(patch.retryDelayMs)) {
+      next.retryDelayMs = Math.max(0, Math.min(30000, Math.trunc(patch.retryDelayMs)));
+    }
+    if (patch.judge !== null && typeof patch.judge === "object") {
+      const judge = next.judge !== null && typeof next.judge === "object" ? { ...next.judge } : {};
+      if (patch.judge.kind === "qev" || patch.judge.kind === "chat") judge.kind = patch.judge.kind;
+      if (typeof patch.judge.baseUrl === "string" && patch.judge.baseUrl.length > 0) {
+        judge.baseUrl = patch.judge.baseUrl.trim();
+      }
+      if (Number.isFinite(patch.judge.threshold)) {
+        judge.threshold = Math.min(0.95, Math.max(0.5, patch.judge.threshold));
+      }
+      if (Number.isFinite(patch.judge.hardThreshold)) {
+        judge.hardThreshold = Math.min(0.99, Math.max(Number(judge.threshold ?? 0.6), patch.judge.hardThreshold));
+      }
+      next.judge = judge;
+    }
+    return next;
+  }
+
+  ctx.commands.register({
+    name: "ttsr-cfg",
+    description: "Read, write, or health-check the TTSR settings (used by the rule panel)",
+    input: { hint: "get|ping|write <json>" },
+    handler: async (invocation) => {
+      const input = invocation.rawInput.trim();
+      const action = (input.split(/\s+/, 1)[0] ?? "").toLowerCase();
+      if (action === "get") {
+        return { kind: "success", text: `${CONFIG_PREFIX}${JSON.stringify(configSnapshot())}` };
+      }
+      if (action === "ping") {
+        const baseUrl = settings.judge.baseUrl;
+        let reachable = false;
+        let detail = "unreachable";
+        try {
+          const response = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(2500) });
+          reachable = response.ok;
+          detail = reachable ? "reachable" : `HTTP ${response.status}`;
+        } catch (error) {
+          detail = error.message;
+        }
+        return {
+          kind: "success",
+          text: `${CONFIG_PREFIX}${JSON.stringify({ ping: { reachable, detail, baseUrl } })}`,
+        };
+      }
+      if (action === "write") {
+        const jsonText = input.slice(action.length).trim();
+        if (jsonText.length === 0) return { kind: "error", text: "Usage: /ttsr-cfg write <json>" };
+        let patch;
+        try {
+          patch = JSON.parse(jsonText);
+        } catch (error) {
+          return { kind: "error", text: `TTSR: invalid settings JSON (${error.message}).` };
+        }
+        if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+          return { kind: "error", text: "TTSR: settings must be a JSON object." };
+        }
+        const result = await writeConfig(ctx, (current) => mergeSettingsPatch(current, patch));
+        if (result === null) return { kind: "error", text: "TTSR: the config editor is unavailable in this profile." };
+        if (result !== null && typeof result === "object" && result.error !== undefined) {
+          return { kind: "error", text: `TTSR: could not save settings: ${result.error}` };
+        }
+        return {
+          kind: "success",
+          text: `${CONFIG_PREFIX}${JSON.stringify({ saved: true, ...configSnapshot() })}`,
+        };
+      }
+      return { kind: "error", text: "Usage: /ttsr-cfg get|ping|write <json>" };
     },
   });
 }
