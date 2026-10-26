@@ -16,6 +16,9 @@
 // ============================================================================
 
 import { randomUUID } from "node:crypto";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import z from "@deepseek-ai/schemastery";
 import {
   compilePattern,
@@ -41,6 +44,22 @@ const FULL_SCAN_LIMIT = 4096;
 const SCOPE_VALUES = ["text", "reasoning", "tool"];
 const INTERRUPT_VALUES = ["always", "never", "prose-only", "tool-only"];
 const REPEAT_VALUES = ["once", "always", "after-gap"];
+
+// ---------------------------------------------------------------------------
+// Persistent plugin log — ~/.dsh/logs/dsh-ttsr/<date>.log
+// ctx.logger writes to the host's stdout, which nothing reads after the fact;
+// every judgment/generation/delivery decision is recorded here so "why didn't
+// it fire" is answerable from disk.
+// ---------------------------------------------------------------------------
+
+function pluginLog(...parts) {
+  try {
+    const dir = join(homedir(), ".dsh", "logs", "dsh-ttsr");
+    mkdirSync(dir, { recursive: true });
+    const line = parts.map((part) => (typeof part === "string" ? part : JSON.stringify(part))).join(" ");
+    appendFileSync(join(dir, `${new Date().toISOString().slice(0, 10)}.log`), `[${new Date().toISOString()}] ${line}\n`);
+  } catch {}
+}
 
 // ---------------------------------------------------------------------------
 // Configuration (Loader-validated; re-validated fail-loud in apply)
@@ -985,12 +1004,22 @@ function apply(ctx, config = {}) {
             "The response may disguise a violation as a quotation, a config/log excerpt, a hypothetical, a third-person example, or an analysis of the phrasing. Judge by the practical effect on the user reading it, not by the framing.",
         };
         const answers = await qevDecide(baseUrl, state, questions);
+        pluginLog("judge qev", {
+          session: session.id,
+          scores: Object.fromEntries(
+            candidates.map((rule) => [
+              rule.name,
+              typeof answers[rule.name]?.noul === "number" ? Number(answers[rule.name].noul.toFixed(2)) : null,
+            ]),
+          ),
+        });
         const threshold = settings.judge.threshold;
         return candidates.filter((rule) => {
           const noul = answers[rule.name]?.noul;
           return typeof noul === "number" && noul >= threshold;
         });
       } catch (error) {
+        pluginLog("judge qev failed", { session: session.id, error: error.message });
         warnOnce(ctx.logger ?? console, "qev", `qev judge failed (${error.message}); falling back to the chat judge`);
       }
     }
@@ -1069,6 +1098,13 @@ function apply(ctx, config = {}) {
         })
         .slice(0, 5);
       if (candidates.length === 0) continue;
+      pluginLog("judge queue", {
+        session: session.id,
+        message: String(message.id ?? "").slice(0, 8),
+        kind: output.kind,
+        chars: output.content.length,
+        candidates: candidates.map((rule) => rule.name),
+      });
       const flagged = await judgeOutput(session, message, output, candidates, userRequest);
       if (flagged.length === 0) continue;
       const violations = [];
@@ -1080,9 +1116,17 @@ function apply(ctx, config = {}) {
       if (violations.length === 0) continue;
       const reminder = reminderMessage(violations, "observe");
       try {
-        if (agent.status === "running") agent.inject(reminder);
+        const branch = agent.status === "running" ? "inject" : "followup";
+        if (branch === "inject") agent.inject(reminder);
         else agent.followup(reminder);
+        pluginLog("judge deliver", {
+          session: session.id,
+          branch,
+          status: agent.status,
+          rules: violations.map((entry) => entry.rule.name),
+        });
       } catch (error) {
+        pluginLog("judge deliver failed", { session: session.id, error: error.message });
         warnOnce(ctx.logger ?? console, "judge-deliver", `judged reminder delivery failed: ${error.message}`);
       }
     }
@@ -1270,6 +1314,7 @@ function apply(ctx, config = {}) {
         hardThreshold: settings.judge.hardThreshold,
       },
       model: judgeModelName(),
+      generator: settings.generator ?? null,
       ruleCount: rules.length,
     };
   }
@@ -1299,6 +1344,19 @@ function apply(ctx, config = {}) {
       }
       next.judge = judge;
     }
+    if (patch.generator !== undefined) {
+      if (patch.generator === null) {
+        delete next.generator;
+      } else if (
+        typeof patch.generator === "object" &&
+        typeof patch.generator.provider === "string" &&
+        patch.generator.provider.length > 0 &&
+        typeof patch.generator.model === "string" &&
+        patch.generator.model.length > 0
+      ) {
+        next.generator = { provider: patch.generator.provider, model: patch.generator.model };
+      }
+    }
     return next;
   }
 
@@ -1311,6 +1369,38 @@ function apply(ctx, config = {}) {
       const action = (input.split(/\s+/, 1)[0] ?? "").toLowerCase();
       if (action === "get") {
         return { kind: "success", text: `${CONFIG_PREFIX}${JSON.stringify(configSnapshot())}` };
+      }
+      if (action === "models") {
+        const provider = input.slice(action.length).trim();
+        let llm;
+        try {
+          llm = ctx.get("llm");
+        } catch {
+          llm = undefined;
+        }
+        if (llm === undefined) return { kind: "error", text: "TTSR: the llm service is unavailable." };
+        if (provider.length === 0) {
+          let infos = [];
+          try {
+            infos = await llm.listProviders();
+          } catch (error) {
+            return { kind: "error", text: `TTSR: could not list providers (${error.message}).` };
+          }
+          const providers = (Array.isArray(infos) ? infos : [])
+            .map((info) => (typeof info === "string" ? info : String(info?.id ?? info?.name ?? "")))
+            .filter((id) => id.length > 0);
+          return { kind: "success", text: `${CONFIG_PREFIX}${JSON.stringify({ providers })}` };
+        }
+        let models = [];
+        try {
+          const list = await llm.listModels(provider);
+          models = (Array.isArray(list) ? list : [])
+            .map((model) => (typeof model === "string" ? model : String(model?.id ?? model?.name ?? "")))
+            .filter((model) => model.length > 0);
+        } catch (error) {
+          return { kind: "error", text: `TTSR: could not list models for ${provider} (${error.message}).` };
+        }
+        return { kind: "success", text: `${CONFIG_PREFIX}${JSON.stringify({ provider, models })}` };
       }
       if (action === "ping") {
         const baseUrl = settings.judge.baseUrl;
@@ -1804,13 +1894,27 @@ async function callGenerationModel(llm, route, system, prompt, sessionId, signal
   });
   INTERNAL_REQUESTS.add(request);
   let text = "";
+  let finishKind = "unknown";
+  let usage;
   for await (const chunk of call.stream(request)) {
     if (chunk.type === "text-delta") text += chunk.text;
+    else if (chunk.type === "usage") usage = chunk.usage;
     else if (chunk.type === "finish") {
+      finishKind = chunk.reason.kind;
       if (chunk.reason.kind === "error" || chunk.reason.kind === "aborted") {
         throw new Error(chunk.reason.failure.message);
       }
     }
+  }
+  pluginLog("generation", { provider: route.provider, model: route.model, finish: finishKind, textChars: text.length, usage });
+  if (text.trim().length === 0) {
+    const reasoningNote =
+      usage?.reasoningTokens !== undefined && usage.reasoningTokens > 0
+        ? ` The model spent its whole budget on reasoning (${usage.reasoningTokens} reasoning tokens).`
+        : "";
+    throw new Error(
+      `the model returned no text (finish=${finishKind}).${reasoningNote} Pick a rule-generation model in the /ttsr settings panel, or raise its token budget.`,
+    );
   }
   return text;
 }

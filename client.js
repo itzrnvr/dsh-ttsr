@@ -43,6 +43,9 @@ window.__ModuleLoader__.load({
         settingsHint: "qev is LabQoat's local open-weights decision model speaking the System One protocol that TypeSafe's jev uses; the thresholds below drive the detection → decision → execution gate.",
         fieldModel: "Decision model",
         fieldModelExternal: "external server",
+        fieldGenerator: "Rule generation model",
+        generatorSession: "Follow session model",
+        generatorHint: "Model /omfg uses to generate rules. \"Follow session model\" uses whatever produced the last reply.",
         fieldKind: "Judge",
         fieldBaseUrl: "Server URL",
         fieldThreshold: "Threshold (soft)",
@@ -78,6 +81,9 @@ window.__ModuleLoader__.load({
         settingsHint: "qev 是 LabQoat 的本地开源决策模型，遵循 TypeSafe jev 使用的 System One 协议；下方阈值驱动 检测 → 决策 → 执行 门控。",
         fieldModel: "决策模型",
         fieldModelExternal: "外部服务",
+        fieldGenerator: "规则生成模型",
+        generatorSession: "跟随会话模型",
+        generatorHint: "/omfg 生成规则时使用的模型。“跟随会话模型”即使用最近一次回复的模型。",
         fieldKind: "判定器",
         fieldBaseUrl: "服务地址",
         fieldThreshold: "阈值（软）",
@@ -148,6 +154,7 @@ window.__ModuleLoader__.load({
       `.${NS}-gear { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border: none; background: transparent; color: var(--dsw-alias-label-tertiary); border-radius: var(--dsw-radius-sm); cursor: pointer; padding: 0; flex: 0 0 auto; }`,
       `.${NS}-gear:hover, .${NS}-gear[aria-pressed="true"] { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }`,
       `.${NS}-field { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 0; }`,
+      `.${NS}-generator { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }`,
       `.${NS}-field-label { color: var(--dsw-alias-label-secondary); font-size: 11.5px; }`,
       `.${NS}-input, .${NS}-select { box-sizing: border-box; font: inherit; font-size: 11.5px; color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-layer-2); border: 0.5px solid var(--dsw-alias-border-l2); border-radius: var(--dsw-radius-sm); padding: 3px 6px; width: 180px; }`,
       `.${NS}-input:focus-visible, .${NS}-select:focus-visible { outline: 1px solid var(--dsw-alias-state-business-primary); outline-offset: 1px; }`,
@@ -360,16 +367,23 @@ window.__ModuleLoader__.load({
           };
         },
         update: (context) => context.state,
-        buildViewNode: (context) => ({
-          key: context.key,
-          kind: NODE_KIND,
-          id: context.id,
-          target: "chat",
-          anchorSeq: context.start.event.seq,
-          location: context.start.location,
-          visibility: "visible",
-          data: context.state,
-        }),
+        buildViewNode: (context) => {
+          // A keyed update can arrive without its start (e.g. the start was
+          // pruned by compaction, or the fold window begins mid-pair). The
+          // shipped workflow-run definition returns null in this case; reading
+          // context.start.event.seq unguarded kills the whole event feed.
+          if (context.start === undefined) return null;
+          return {
+            key: context.key,
+            kind: NODE_KIND,
+            id: context.id,
+            target: "chat",
+            anchorSeq: context.start.event.seq,
+            location: context.start.location,
+            visibility: "visible",
+            data: context.state,
+          };
+        },
       });
 
       ctx.slots.inject("conversation.chat.node", () =>
@@ -458,6 +472,8 @@ window.__ModuleLoader__.load({
       const [loading, setLoading] = React.useState(false);
       const [settingsOpen, setSettingsOpen] = React.useState(false);
       const [settings, setSettings] = React.useState(null);
+      const [modelProviders, setModelProviders] = React.useState(null);
+      const [modelList, setModelList] = React.useState(null);
       const [saving, setSaving] = React.useState(false);
       const [pingState, setPingState] = React.useState(null);
       const rootRef = React.useRef(null);
@@ -530,6 +546,10 @@ window.__ModuleLoader__.load({
             maxRetriesPerStep: String(snapshot.maxRetriesPerStep ?? 2),
             retryDelayMs: String(snapshot.retryDelayMs ?? 300),
             model: typeof snapshot.model === "string" ? snapshot.model : null,
+            generator:
+              snapshot.generator !== null && typeof snapshot.generator === "object"
+                ? { provider: String(snapshot.generator.provider ?? ""), model: String(snapshot.generator.model ?? "") }
+                : null,
             judge: {
               kind: snapshot.judge?.kind === "chat" ? "chat" : "qev",
               baseUrl: String(snapshot.judge?.baseUrl ?? ""),
@@ -537,6 +557,26 @@ window.__ModuleLoader__.load({
               hardThreshold: String(snapshot.judge?.hardThreshold ?? 0.75),
             },
           });
+          // Provider list for the generator picker (best effort).
+          runCommand("/ttsr-cfg models")
+            .then((text2) => {
+              if (text2.startsWith(CONFIG_PREFIX)) {
+                const parsed = JSON.parse(text2.slice(CONFIG_PREFIX.length));
+                if (Array.isArray(parsed.providers)) setModelProviders(parsed.providers);
+              }
+            })
+            .catch(() => {});
+          // Preload the model list when a generator is already configured.
+          if (typeof snapshot.generator?.provider === "string" && snapshot.generator.provider.length > 0) {
+            runCommand(`/ttsr-cfg models ${snapshot.generator.provider}`)
+              .then((text2) => {
+                if (text2.startsWith(CONFIG_PREFIX)) {
+                  const parsed = JSON.parse(text2.slice(CONFIG_PREFIX.length));
+                  if (Array.isArray(parsed.models)) setModelList(parsed.models);
+                }
+              })
+              .catch(() => {});
+          }
         } catch (cause) {
           setError(String(cause?.message ?? cause));
         }
@@ -599,6 +639,20 @@ window.__ModuleLoader__.load({
         });
       };
 
+      const onGeneratorProvider = (provider) => {
+        updateSettings("generator", provider.length === 0 ? null : { provider, model: "" });
+        setModelList(null);
+        if (provider.length === 0) return;
+        runCommand(`/ttsr-cfg models ${provider}`)
+          .then((text) => {
+            if (text.startsWith(CONFIG_PREFIX)) {
+              const parsed = JSON.parse(text.slice(CONFIG_PREFIX.length));
+              if (Array.isArray(parsed.models)) setModelList(parsed.models);
+            }
+          })
+          .catch(() => {});
+      };
+
       const onSaveSettings = () => {
         if (settings === null || saving) return;
         setSaving(true);
@@ -615,6 +669,15 @@ window.__ModuleLoader__.load({
             threshold: Number(settings.judge.threshold),
             hardThreshold: Number(settings.judge.hardThreshold),
           },
+          generator:
+            settings.generator !== null &&
+            typeof settings.generator === "object" &&
+            typeof settings.generator.provider === "string" &&
+            settings.generator.provider.length > 0 &&
+            typeof settings.generator.model === "string" &&
+            settings.generator.model.length > 0
+              ? { provider: settings.generator.provider, model: settings.generator.model }
+              : null,
         };
         runCommand(`/ttsr-cfg write ${JSON.stringify(patch)}`)
           .then((text) => {
@@ -670,6 +733,42 @@ window.__ModuleLoader__.load({
             t("fieldModel"),
             h("span", { className: `${NS}-status` }, settings?.model ?? t("fieldModelExternal")),
           ),
+          field(
+            t("fieldGenerator"),
+            h(
+              "div",
+              { className: `${NS}-generator` },
+              h(
+                "select",
+                {
+                  className: `${NS}-select`,
+                  value: settings?.generator?.provider ?? "",
+                  onChange: (event) => onGeneratorProvider(event.target.value),
+                },
+                h("option", { value: "" }, t("generatorSession")),
+                (modelProviders ?? []).map((provider) =>
+                  h("option", { key: provider, value: provider }, provider),
+                ),
+              ),
+              settings?.generator?.provider
+                ? h(
+                    "select",
+                    {
+                      className: `${NS}-select`,
+                      value: settings?.generator?.model ?? "",
+                      onChange: (event) =>
+                        updateSettings("generator", {
+                          provider: settings.generator.provider,
+                          model: event.target.value,
+                        }),
+                    },
+                    h("option", { value: "" }, "—"),
+                    (modelList ?? []).map((model) => h("option", { key: model, value: model }, model)),
+                  )
+                : null,
+            ),
+          ),
+          h("div", { className: `${NS}-hint` }, t("generatorHint")),
           field(
             t("fieldKind"),
             h(
@@ -914,16 +1013,21 @@ window.__ModuleLoader__.load({
         },
         start: () => ({ hidden: true }),
         update: (context) => context.state,
-        buildViewNode: (context) => ({
-          key: context.key,
-          kind: HIDDEN_KIND,
-          id: context.id,
-          target: "chat",
-          anchorSeq: context.start.event.seq,
-          location: context.start.location,
-          visibility: "hidden",
-          data: {},
-        }),
+        buildViewNode: (context) => {
+          // A done can outlive its run (the run event pruned by compaction);
+          // folding that startless update must not throw.
+          if (context.start === undefined) return null;
+          return {
+            key: context.key,
+            kind: HIDDEN_KIND,
+            id: context.id,
+            target: "chat",
+            anchorSeq: context.start.event.seq,
+            location: context.start.location,
+            visibility: "hidden",
+            data: {},
+          };
+        },
       });
 
       // The rule panel itself: a composer-dock entry (popup beside the input).
