@@ -81,16 +81,24 @@ the violating attempt never becomes model-visible, and the rule text rides the r
 - **Observe-only rules** (`interruptMode: never`, and prose-only/tool-only rules matching out of
   mode) inject the reminder passively without aborting: tool-source matches attach to the tool
   result via `tools/post-execute` `additionalContexts`; prose matches steer the next step.
+- **Composer dock pill + rule panel** — a "TTSR rules" button beside the stock composer stats
+  opens the session rule panel: live per-rule switches (persisted per session), a master toggle,
+  and a settings editor — judge kind/URL/thresholds, retry caps, subagent monitoring, and the
+  **rule-generation model picker** for `/omfg`: provider + model dropdowns sourced from
+  `/ttsr-cfg models`, or "follow session model" (whatever produced the last reply). Judged
+  reminders delivered while the turn is over arrive as a follow-up step the model must comply
+  with; delivered mid-turn they steer the next step.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `/omfg <description>` | Generates rule candidates with the session's model. The generator reads a **full transcript** (user messages in full, recent assistant output near-full, up to ~120k chars) at medium reasoning effort, and must quote **verbatim evidence** of the offense from the conversation. Validation rejects any candidate whose evidence cannot be found in the transcript, and any regex that does not match its own evidence — generic rules cannot survive. Surviving candidates show evidence + match counts in a **native multi-select confirm card**; selected rules persist through `configEditor` into the user's `cordis.patch.yml` and the rulebook reloads live. |
+| `/omfg <description>` | Generates rule candidates with the session's model (or the configured `generator`). The generator reads a **full transcript** (user messages in full, recent assistant output near-full, up to ~120k chars) at medium reasoning effort, and must quote **verbatim evidence** of the offense from the conversation. Validation rejects any candidate whose evidence cannot be found in the transcript, and any regex that does not match its own evidence — generic rules cannot survive. Empty generations fail loudly with the finish reason and reasoning-token burn. Surviving candidates show evidence + match counts in a **native multi-select confirm card**; selected rules persist through `configEditor` into the user's `cordis.patch.yml` and the rulebook reloads live. |
 | `/ttsr` | Lists rules with scope/interrupt/repeat settings and enabled state. |
 | `/ttsr test <regex>` | Counts matches of a regex across this session's assistant text and tool-call arguments. |
 | `/ttsr forget <name>` | Removes a rule (persisted through `configEditor`). |
 | `/ttsr on` / `/ttsr off` | Enables/disables monitoring (persisted). |
+| `/ttsr-cfg get \| ping \| models [provider] \| write <json>` | The settings surface behind the panel: read the config snapshot, health-check the judge server (bringing the local model up first), list LLM providers/models for the generator picker, or persist a settings patch (including `generator`) through `configEditor`. |
 
 ## Configuration (profile `cordis.patch.yml`, row `dsh-ttsr`)
 
@@ -124,6 +132,14 @@ the violating attempt never becomes model-visible, and the rule text rides the r
   folding `dsh-ttsr:reminder` surface messages, so suppression survives reload and restart).
 - `always` — every match interrupts (bounded by `maxRetriesPerStep` per step).
 - `after-gap` — re-fires after N completed turns.
+
+## Diagnostics
+
+Every decision is recorded to `~/.dsh/logs/dsh-ttsr/<date>.log`: the candidate rules queued per
+assistant message, the judge's per-rule scores, the delivery branch (`inject` vs `followup`) with
+the agent status, and `/omfg` generation stats (route, finish reason, text length, token usage).
+When a rule does not fire, that file answers why — `ctx.logger` alone goes to host stdout, which
+nothing reads after the fact.
 
 ## Files
 
