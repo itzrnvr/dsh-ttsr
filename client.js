@@ -26,13 +26,15 @@ window.__ModuleLoader__.load({
         cardTitle: "Stream rule injected",
         observeTitle: "Stream rule matched",
         softTitle: "Stream rule noted — keep both tracks",
+        continueTitle: "Turn ended early — work restarted",
         retryNote: "The violating attempt was discarded and the step was retried with this rule applied.",
         observeNote: "The output was not interrupted; this reminder was injected for the next step.",
         softNote: "Allowed through with a note: pragmatic work is fine, but it must not be the only focus — keep the full engineering going.",
+        continueNote: "The previous turn ended with the requested work unfinished; this reminder restarted the work.",
         matched: "matched",
         ruleLabel: "rule",
-        panelTitle: "TTSR rules — this session",
-        panelNote: "Toggles apply to this session only; the global config is untouched. Mutes survive reload.",
+        panelTitle: "TTSR rules",
+        panelNote: "Toggles are global and persisted: every session, survives restarts.",
         dockButton: "TTSR rules",
         noRules: "No rules configured — use /omfg <description>.",
         on: "ON",
@@ -64,13 +66,15 @@ window.__ModuleLoader__.load({
         cardTitle: "已注入流规则",
         observeTitle: "命中流规则",
         softTitle: "已记录流规则 — 双线并行",
+        continueTitle: "回合提前结束 — 已重启工作",
         retryNote: "违规输出已被丢弃，并在应用该规则后重试了本步骤。",
         observeNote: "输出未被中断；该提醒已注入供下一步使用。",
         softNote: "已放行并附注：务实工作没问题，但不能只做它 — 全面的工程工作要继续。",
+        continueNote: "上一回合在请求的工作未完成时结束；此提醒已重启工作。",
         matched: "命中",
         ruleLabel: "规则",
-        panelTitle: "TTSR 规则 — 本会话",
-        panelNote: "开关仅对本会话生效；全局配置不变。静音在重载后保留。",
+        panelTitle: "TTSR 规则",
+        panelNote: "开关全局生效并持久化：所有会话、重启后保留。",
         dockButton: "TTSR 规则",
         noRules: "暂无规则 — 使用 /omfg <描述> 生成。",
         on: "开",
@@ -295,6 +299,8 @@ window.__ModuleLoader__.load({
       const data = node?.data ?? {};
       const t = props?.t ?? ((key) => dictionaries.en[key] ?? key);
       const observe = data.mode === "observe";
+      const soft = data.mode === "soft";
+      const cont = data.mode === "continue";
       const rules = Array.isArray(data.rules) && data.rules.length > 0 ? data.rules : [{ name: "?", matched: undefined, message: undefined }];
 
       return h(
@@ -312,7 +318,7 @@ window.__ModuleLoader__.load({
           h(
             "span",
             { className: `${NS}-title` },
-            t(observe === "soft" ? "softTitle" : observe ? "observeTitle" : "cardTitle"),
+            t(soft ? "softTitle" : cont ? "continueTitle" : observe ? "observeTitle" : "cardTitle"),
           ),
         ),
         rules.map((rule, index) =>
@@ -326,7 +332,7 @@ window.__ModuleLoader__.load({
             rule.message ? h("div", { className: `${NS}-message` }, rule.message) : null,
           ),
         ),
-        h("div", { className: `${NS}-note` }, t(observe === "soft" ? "softNote" : observe ? "observeNote" : "retryNote")),
+        h("div", { className: `${NS}-note` }, t(soft ? "softNote" : cont ? "continueNote" : observe ? "observeNote" : "retryNote")),
       );
     }
 
@@ -362,7 +368,10 @@ window.__ModuleLoader__.load({
             (ruleName) => parsed.find((rule) => rule.name === ruleName) ?? { name: ruleName },
           );
           return {
-            mode: message.source?.mode === "observe" || message.source?.mode === "soft" ? message.source.mode : "interrupt",
+            mode:
+              message.source?.mode === "observe" || message.source?.mode === "soft" || message.source?.mode === "continue"
+                ? message.source.mode
+                : "interrupt",
             rules: merged,
           };
         },
