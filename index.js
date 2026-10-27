@@ -558,8 +558,10 @@ function apply(ctx, config = {}) {
     if (candidates.length === 0) return;
     if (settings.judge.kind !== "qev") return; // turn-outcome judging needs the decision model
     let answers;
+    let decisionState;
+    let baseUrl;
     try {
-      const baseUrl = await ensureQev();
+      baseUrl = await ensureQev();
       const questions = {};
       for (const rule of candidates) {
         questions[rule.name] = {
@@ -567,7 +569,7 @@ function apply(ctx, config = {}) {
           instructions: `${rule.question} Judge the OUTCOME of the whole turn, not its wording: transitional narration, quoted text, and status reports are not violations unless the work actually stopped.`,
         };
       }
-      const decisionState = {
+      decisionState = {
         role: "assistant_turn",
         user_request: userRequest ?? "(the user's request is not available)",
         turn_actions: `${turnTools.length} tool call(s): ${[...new Set(turnTools)].join(", ") || "none"}`,
@@ -589,13 +591,41 @@ function apply(ctx, config = {}) {
       return;
     }
     const threshold = settings.judge.threshold;
-    const violations = [];
-    for (const rule of candidates) {
+    const preliminary = candidates.filter((rule) => {
       const noul = answers[rule.name]?.noul;
-      if (typeof noul === "number" && noul >= threshold) {
-        markInjected(state, rule.name, event.data?.turn);
-        violations.push({ rule, excerpt: turnText.trim().slice(0, 120) });
+      return typeof noul === "number" && noul >= threshold;
+    });
+    if (preliminary.length === 0) return;
+    // Discussion gate: a turn that merely cites, quotes, or engineers the rule
+    // text itself (rule names, config, migration summaries) is not a violation.
+    // Without this gate, turns dense in rule vocabulary fire their own rules.
+    let gateAnswers = null;
+    try {
+      const gateQuestions = {};
+      for (const rule of preliminary) {
+        gateQuestions[rule.name] = {
+          type: "noul",
+          instructions:
+            "Is the ONLY role of the prohibited wording in this turn to cite, quote, configure, or analyze the rule system itself (for example an assistant engineering, migrating, or documenting these rules), with no recommending, concluding, planning, or acting on the prohibited behavior anywhere in the turn?",
+        };
       }
+      gateAnswers = await qevDecide(baseUrl, decisionState, gateQuestions);
+    } catch (error) {
+      pluginLog("judge turn-end gate failed", { session: session.id, error: error.message });
+    }
+    const violations = [];
+    for (const rule of preliminary) {
+      const discussionOnly = gateAnswers?.[rule.name]?.noul;
+      if (typeof discussionOnly === "number" && discussionOnly >= threshold) {
+        pluginLog("judge turn-end gate cleared", {
+          session: session.id,
+          rule: rule.name,
+          discussion_only: Number(discussionOnly.toFixed(2)),
+        });
+        continue;
+      }
+      markInjected(state, rule.name, event.data?.turn);
+      violations.push({ rule, excerpt: turnText.trim().slice(0, 120) });
     }
     if (violations.length === 0) return;
     const reminder = reminderMessage(violations, "continue");
