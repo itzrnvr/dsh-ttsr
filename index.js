@@ -170,6 +170,18 @@ function compileRule(raw, logger) {
       return null;
     }
   });
+  // Optional applicability gate: a turn-end rule is only judged when the
+  // session's request (or the turn itself) matches this pattern. Domain rules
+  // (e.g. optimization/hardware) must not fire in unrelated sessions.
+  let applies = null;
+  if (typeof raw.applies === "string" && raw.applies.length > 0) {
+    try {
+      applies = new RegExp(raw.applies, "i");
+    } catch (error) {
+      warnOnce(logger, raw.name, `rule "${raw.name}" skipped: applies does not compile: ${error.message}`);
+      return null;
+    }
+  }
   return {
     name: raw.name,
     condition: hasCondition ? raw.condition : undefined,
@@ -187,6 +199,7 @@ function compileRule(raw, logger) {
     astItems,
     disabled: raw.disabled === true,
     turnEnd: raw.when === "turn-end",
+    applies,
     canText: scope.includes("text"),
     canReasoning: scope.includes("reasoning"),
     canTool: scope.includes("tool"),
@@ -643,7 +656,17 @@ function apply(ctx, config = {}) {
     if (turnText.trim().length < 80 && turnTools.length === 0) return;
     const userRequest = lastUserRequest(agent);
     const candidates = turnEndRules
-      .filter((rule) => !state.disabled.has(rule.name) && repeatAllows(state, session, rule))
+      .filter((rule) => {
+        if (state.disabled.has(rule.name)) return false;
+        if (rule.applies !== null) {
+          const haystack = typeof userRequest === "string" && userRequest.length > 0 ? userRequest : turnText;
+          if (!rule.applies.test(haystack)) {
+            pluginLog("judge turn-end skipped", { session: session.id, rule: rule.name, reason: "not applicable" });
+            return false;
+          }
+        }
+        return repeatAllows(state, session, rule);
+      })
       .slice(0, 5);
     if (candidates.length === 0) return;
     if (settings.judge.kind !== "qev") return; // turn-outcome judging needs the decision model
