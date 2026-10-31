@@ -591,9 +591,18 @@ window.__ModuleLoader__.load({
         }
       };
 
+      // Reload whenever the panel opens for a DIFFERENT session: rule states
+      // are per-session, so a cached list from the previous session must never
+      // be shown against this one. Same-session reopens reuse the fresh list.
+      const loadedFor = React.useRef(null);
       React.useEffect(() => {
-        if (open && rules.length === 0 && loading === false) load();
-      }, [open]);
+        if (!open || sessionId === undefined) return;
+        if (loadedFor.current === sessionId) return;
+        loadedFor.current = sessionId;
+        setRules([]);
+        setError(null);
+        load();
+      }, [open, sessionId]);
 
       const applyRulePayload = (text) => {
         const parsed = parsePanelText(text);

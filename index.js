@@ -315,6 +315,7 @@ function stateOf(sessionId) {
       judgmentBusy: false, // one judge batch at a time per session
       judgmentQueue: [],
       disabled: new Set(), // rule names muted in THIS session only (restored from its own log)
+      mutesLoaded: false, // projection mutes for this session have been loaded once
       turnText: "", // accumulated prose of the current turn (turn-outcome judging)
       turnTools: [], // tool-call names dispatched in the current turn
       verifiedNo: new Map(), // rule name -> buffer length at its last not-a-violation verdict
@@ -349,22 +350,27 @@ function apply(ctx, config = {}) {
   }
 
   /** Restore this session's mute set from its own projection. Session-scoped:
-   *  toggles in one session never touch another session's state. */
+   *  toggles in one session never touch another session's state. Loads ONCE
+   *  per session lifetime (mutesLoaded), so a stale projection can never
+   *  clobber a toggle that just happened in this process. */
   function syncDisabled(state, session) {
+    if (state.mutesLoaded) return;
     if (session === undefined) return;
     const projected = readProjection(session);
+    state.mutesLoaded = true;
     const mutes = projected?.mutes;
     if (mutes === null || mutes === undefined) return; // no session mutes recorded yet
     state.disabled = new Set(Object.keys(mutes).filter((name) => mutes[name] === true));
   }
 
   /** Full snapshot of THIS session's rule states for panels and commands.
-   *  `muted` = muted in this session (overlay); rules disabled in the global
-   *  config are excluded from enforcement entirely and flagged here too. */
+   *  `muted` = muted in THIS session only. (A rule's global `disabled` flag is
+   *  a rulebook-level kill switch edited in YAML; it is not a panel control and
+   *  is deliberately NOT conflated with session mutes here.) */
   function ruleSnapshot(state) {
     return rules.map((rule) => ({
       name: rule.name,
-      muted: state.disabled.has(rule.name) || rule.disabled === true,
+      muted: state.disabled.has(rule.name),
       trigger:
         rule.regex !== null
           ? `/${rule.condition}/`
@@ -486,20 +492,23 @@ function apply(ctx, config = {}) {
       stateSchema: z.object({
         injectedRules: z.array(z.string()),
         completedTurns: z.number(),
-        mutes: z.object(z.string(), z.boolean()),
+        mutes: z.dict(z.boolean()),
       }),
       init: () => ({ injectedRules: [], completedTurns: 0, mutes: {} }),
       apply: (state, event) => {
         if (event.type === "turn/end") return { injectedRules: state.injectedRules, completedTurns: state.completedTurns + 1, mutes: state.mutes };
         if (event.type === "command/done") {
-          // Session mutes ride on ttsr-set / panel command results — existing,
-          // legal event types — so each session's toggles persist in ITS OWN
-          // log and never leak into another session.
+          // Session mutes ride on the ttsr-set toggle command's result — an
+          // existing, legal event type — so each session's toggles persist in
+          // ITS OWN log and never leak into another session. Only actual
+          // toggles (SET_PREFIX) fold; the read-only panel snapshot does not.
+          // Only v2+ snapshots carry session-scoped mutes: legacy (global-era)
+          // snapshots conflated the global disabled flag with session mutes.
           const text = String(event.data?.text ?? "");
-          if (text.startsWith(SET_PREFIX) || text.startsWith(PANEL_PREFIX)) {
+          if (text.startsWith(SET_PREFIX)) {
             try {
               const parsed = JSON.parse(text.slice(text.indexOf("{")));
-              if (Array.isArray(parsed?.rules)) {
+              if (parsed?.v === 2 && Array.isArray(parsed.rules)) {
                 const mutes = {};
                 for (const rule of parsed.rules) if (rule !== null && typeof rule.name === "string") mutes[rule.name] = rule.muted === true;
                 return { injectedRules: state.injectedRules, completedTurns: state.completedTurns, mutes };
@@ -524,7 +533,9 @@ function apply(ctx, config = {}) {
         return changed ? { injectedRules: [...merged], completedTurns: state.completedTurns, mutes: state.mutes } : state;
       },
     });
+    pluginLog("projection registered", { key: "ttsr", stateVersion: 4 });
   } catch (error) {
+    pluginLog("projection register failed", { error: String(error?.message ?? error) });
     warnOnce(ctx.logger ?? console, "projection", `session projection unavailable (${error.message}); repeat state resets on reload`);
   }
 
@@ -544,6 +555,8 @@ function apply(ctx, config = {}) {
         if (Number.isInteger(event.data?.turn)) state.currentTurn = event.data.turn;
         state.turnText = "";
         state.turnTools = [];
+        // Load this session's persisted mutes before the turn's first output.
+        syncDisabled(state, session);
       }
       return;
     }
@@ -580,6 +593,7 @@ function apply(ctx, config = {}) {
     })();
     if (agent === undefined) return;
     const state = stateOf(session.id);
+    syncDisabled(state, session);
     const turnText = state.turnText ?? "";
     const turnTools = state.turnTools ?? [];
     // Nothing to judge: a turn with no prose and no actions carries no outcome.
@@ -1222,6 +1236,7 @@ function apply(ctx, config = {}) {
     })();
     if (agent === undefined) return;
     const state = stateOf(session.id);
+    syncDisabled(state, session);
     const userRequest = lastUserRequest(agent);
     for (const output of messageOutputs(message)) {
       if (output.content.length < 40) continue;
@@ -1406,7 +1421,7 @@ function apply(ctx, config = {}) {
     if (mute) next.add(target.name);
     else next.delete(target.name);
     applyMutes(invocation.agent, next);
-    return { kind: "success", text: `${SET_PREFIX}${JSON.stringify({ rules: ruleSnapshot(state) })}` };
+    return { kind: "success", text: `${SET_PREFIX}${JSON.stringify({ v: 2, rules: ruleSnapshot(state) })}` };
   }
 
   const sessionHelpers = { setSessionRule, ruleSnapshot, applyMutes, syncDisabled, sessionOf };
@@ -1593,7 +1608,28 @@ function apply(ctx, config = {}) {
           text: `${CONFIG_PREFIX}${JSON.stringify({ saved: true, ...configSnapshot() })}`,
         };
       }
-      return { kind: "error", text: "Usage: /ttsr-cfg get|ping|write <json>" };
+      if (action === "probe") {
+        const session = sessionOf(invocation.agent);
+        const state = stateOf(invocation.agent.id);
+        let projection = null;
+        let projectionError = null;
+        try {
+          projection = ctx.sessionProjections.stateOf(session, "ttsr");
+        } catch (error) {
+          projectionError = String(error?.message ?? error);
+        }
+        return {
+          kind: "success",
+          text: `${CONFIG_PREFIX}${JSON.stringify({
+            session: invocation.agent.id,
+            hasSession: session !== undefined,
+            projection,
+            projectionError,
+            liveDisabled: [...state.disabled],
+          })}`,
+        };
+      }
+      return { kind: "error", text: "Usage: /ttsr-cfg get|ping|probe|write <json>" };
     },
   });
 }
@@ -1611,7 +1647,7 @@ async function runTtsr(ctx, settings, rules, helpers, invocation) {
     if (rules.length === 0) return { kind: "success", text: "TTSR: no rules configured. Use /omfg <description> to generate one." };
     const state = stateOf(invocation.agent.id);
     helpers.syncDisabled(state, helpers.sessionOf(invocation.agent));
-    return { kind: "success", text: `${PANEL_PREFIX}${JSON.stringify({ rules: helpers.ruleSnapshot(state) })}` };
+    return { kind: "success", text: `${PANEL_PREFIX}${JSON.stringify({ v: 2, rules: helpers.ruleSnapshot(state) })}` };
   }
 
   if (command === "rules") {
@@ -1648,7 +1684,7 @@ async function runTtsr(ctx, settings, rules, helpers, invocation) {
     helpers.applyMutes(invocation.agent, next);
     return {
       kind: "success",
-      text: `${SET_PREFIX}${JSON.stringify({ rules: helpers.ruleSnapshot(stateOf(invocation.agent.id)) })}`,
+      text: `${SET_PREFIX}${JSON.stringify({ v: 2, rules: helpers.ruleSnapshot(stateOf(invocation.agent.id)) })}`,
     };
   }
 
@@ -1668,7 +1704,7 @@ async function runTtsr(ctx, settings, rules, helpers, invocation) {
       helpers.applyMutes(invocation.agent, new Set());
       return {
         kind: "success",
-        text: `${SET_PREFIX}${JSON.stringify({ rules: helpers.ruleSnapshot(stateOf(invocation.agent.id)) })}`,
+        text: `${SET_PREFIX}${JSON.stringify({ v: 2, rules: helpers.ruleSnapshot(stateOf(invocation.agent.id)) })}`,
       };
     }
     return helpers.setSessionRule(invocation, rest, command === "off");
@@ -1678,7 +1714,7 @@ async function runTtsr(ctx, settings, rules, helpers, invocation) {
     helpers.applyMutes(invocation.agent, new Set(rules.filter((rule) => !rule.disabled).map((rule) => rule.name)));
     return {
       kind: "success",
-      text: `${SET_PREFIX}${JSON.stringify({ rules: helpers.ruleSnapshot(stateOf(invocation.agent.id)) })}`,
+      text: `${SET_PREFIX}${JSON.stringify({ v: 2, rules: helpers.ruleSnapshot(stateOf(invocation.agent.id)) })}`,
     };
   }
 
