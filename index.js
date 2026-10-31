@@ -96,6 +96,7 @@ const Config = z.object({
         tools: z.array(z.string()).default([]),
         globs: z.array(z.string()).default([]),
         when: z.string(),
+        applies: z.string(),
         disabled: z.boolean(),
         interruptMode: z.string().default("always"),
         repeatMode: z.string().default("once"),
