@@ -314,6 +314,7 @@ function stateOf(sessionId) {
       judged: new Set(), // assistant message ids already judged
       judgmentBusy: false, // one judge batch at a time per session
       judgmentQueue: [],
+      disabled: new Set(), // rule names muted in THIS session only (restored from its own log)
       turnText: "", // accumulated prose of the current turn (turn-outcome judging)
       turnTools: [], // tool-call names dispatched in the current turn
       verifiedNo: new Map(), // rule name -> buffer length at its last not-a-violation verdict
@@ -326,7 +327,6 @@ function stateOf(sessionId) {
 function apply(ctx, config = {}) {
   const settings = resolveSettings(config, ctx.logger ?? console);
   const rules = settings.rules;
-  const rulesByName = new Map(rules.map((rule) => [rule.name, rule]));
   const activeRules = rules.filter((rule) => !rule.disabled);
   const astRules = activeRules.filter((rule) => rule.astItems !== null);
   const questionRules = activeRules.filter((rule) => rule.question !== undefined && !rule.turnEnd);
@@ -336,21 +336,35 @@ function apply(ctx, config = {}) {
     try {
       const state = ctx.sessionProjections.stateOf(session, "ttsr");
       if (state !== null && typeof state === "object") {
+        const mutes =
+          state.mutes !== null && typeof state.mutes === "object" && !Array.isArray(state.mutes) ? state.mutes : null;
         return {
           injectedRules: Array.isArray(state.injectedRules) ? state.injectedRules.filter((entry) => typeof entry === "string") : [],
           completedTurns: Number.isInteger(state.completedTurns) ? state.completedTurns : 0,
+          mutes,
         };
       }
     } catch {}
     return null;
   }
 
-  /** Full snapshot of rule states for panels and commands. `muted` reflects the
-   *  global, config-persisted disabled flag — the only mute state there is. */
-  function ruleSnapshot() {
+  /** Restore this session's mute set from its own projection. Session-scoped:
+   *  toggles in one session never touch another session's state. */
+  function syncDisabled(state, session) {
+    if (session === undefined) return;
+    const projected = readProjection(session);
+    const mutes = projected?.mutes;
+    if (mutes === null || mutes === undefined) return; // no session mutes recorded yet
+    state.disabled = new Set(Object.keys(mutes).filter((name) => mutes[name] === true));
+  }
+
+  /** Full snapshot of THIS session's rule states for panels and commands.
+   *  `muted` = muted in this session (overlay); rules disabled in the global
+   *  config are excluded from enforcement entirely and flagged here too. */
+  function ruleSnapshot(state) {
     return rules.map((rule) => ({
       name: rule.name,
-      muted: rule.disabled === true,
+      muted: state.disabled.has(rule.name) || rule.disabled === true,
       trigger:
         rule.regex !== null
           ? `/${rule.condition}/`
@@ -362,23 +376,22 @@ function apply(ctx, config = {}) {
     }));
   }
 
-  /** Persist a rule's enabled/disabled state to the global config through the
-   *  configEditor (the user's patch layer), which reloads the rulebook live. */
-  async function setRuleDisabled(ruleName, disabled) {
-    const target = rulesByName.get(ruleName);
-    if (target === undefined) return { ok: false, error: `no rule named "${ruleName}"` };
-    const outcome = await writeConfig(ctx, (current) => {
-      const existing = Array.isArray(current?.rules) ? [...current.rules] : [];
-      const index = existing.findIndex((entry) => entry?.name === ruleName);
-      const entry = index >= 0 ? { ...existing[index] } : { name: ruleName, message: target.message };
-      if (disabled) entry.disabled = true;
-      else delete entry.disabled;
-      if (index >= 0) existing[index] = entry;
-      else existing.push(entry);
-      return { ...current, rules: existing };
-    });
-    if (outcome === true) return { ok: true };
-    return { ok: false, error: typeof outcome === "object" && outcome !== null ? outcome.error : "configEditor unavailable" };
+  /** Apply a mute change to this session's live state. Durability is free: the
+   *  ttsr-set command that reaches here has its result (a full rule snapshot)
+   *  logged as a command/done event in THIS session's log, and the projection
+   *  below folds those snapshots back into per-session mutes on resume. No
+   *  novel event types are appended (v4 rejects those). */
+  function applyMutes(agent, nextDisabled) {
+    const state = stateOf(agent.id);
+    state.disabled = nextDisabled;
+  }
+
+  function sessionOf(agent) {
+    try {
+      return agent.session;
+    } catch {
+      return undefined;
+    }
   }
 
   /** Mark a rule injected, recording the turn it fired at for after-gap repeats. */
@@ -465,18 +478,36 @@ function apply(ctx, config = {}) {
     return payload?.answers ?? {};
   }
 
-  // ---- durable repeat state, derived from the session log ----
+  // ---- durable repeat + per-session mute state, derived from the session log ----
   try {
     ctx.sessionProjections.register({
       key: "ttsr",
-      stateVersion: 3,
+      stateVersion: 4,
       stateSchema: z.object({
         injectedRules: z.array(z.string()),
         completedTurns: z.number(),
+        mutes: z.object(z.string(), z.boolean()),
       }),
-      init: () => ({ injectedRules: [], completedTurns: 0 }),
+      init: () => ({ injectedRules: [], completedTurns: 0, mutes: {} }),
       apply: (state, event) => {
-        if (event.type === "turn/end") return { injectedRules: state.injectedRules, completedTurns: state.completedTurns + 1 };
+        if (event.type === "turn/end") return { injectedRules: state.injectedRules, completedTurns: state.completedTurns + 1, mutes: state.mutes };
+        if (event.type === "command/done") {
+          // Session mutes ride on ttsr-set / panel command results — existing,
+          // legal event types — so each session's toggles persist in ITS OWN
+          // log and never leak into another session.
+          const text = String(event.data?.text ?? "");
+          if (text.startsWith(SET_PREFIX) || text.startsWith(PANEL_PREFIX)) {
+            try {
+              const parsed = JSON.parse(text.slice(text.indexOf("{")));
+              if (Array.isArray(parsed?.rules)) {
+                const mutes = {};
+                for (const rule of parsed.rules) if (rule !== null && typeof rule.name === "string") mutes[rule.name] = rule.muted === true;
+                return { injectedRules: state.injectedRules, completedTurns: state.completedTurns, mutes };
+              }
+            } catch {}
+          }
+          return state;
+        }
         if (event.type !== "user/message") return state;
         const source = event.data?.source;
         if (source?.kind !== REMINDER_SOURCE) return state;
@@ -490,7 +521,7 @@ function apply(ctx, config = {}) {
             changed = true;
           }
         }
-        return changed ? { injectedRules: [...merged], completedTurns: state.completedTurns } : state;
+        return changed ? { injectedRules: [...merged], completedTurns: state.completedTurns, mutes: state.mutes } : state;
       },
     });
   } catch (error) {
@@ -554,7 +585,9 @@ function apply(ctx, config = {}) {
     // Nothing to judge: a turn with no prose and no actions carries no outcome.
     if (turnText.trim().length < 80 && turnTools.length === 0) return;
     const userRequest = lastUserRequest(agent);
-    const candidates = turnEndRules.filter((rule) => repeatAllows(state, session, rule)).slice(0, 5);
+    const candidates = turnEndRules
+      .filter((rule) => !state.disabled.has(rule.name) && repeatAllows(state, session, rule))
+      .slice(0, 5);
     if (candidates.length === 0) return;
     if (settings.judge.kind !== "qev") return; // turn-outcome judging needs the decision model
     let answers;
@@ -668,6 +701,7 @@ function apply(ctx, config = {}) {
   function checkBuffer(entry, source, state, session) {
     for (const rule of rules) {
       if (rule.disabled) continue; // disabled in the global config
+      if (state.disabled.has(rule.name)) continue; // muted in THIS session
       if (rule.regex === null) continue; // astCondition/question triggers never fire here
       const scopeOk =
         (source === "text" && rule.canText) ||
@@ -960,6 +994,7 @@ function apply(ctx, config = {}) {
     })();
     const state = stateOf(agent.id);
     for (const rule of astRules) {
+      if (state.disabled.has(rule.name)) continue; // muted in THIS session
       if (rule.tools.length > 0 && !rule.tools.includes(exec.name)) continue;
       if (!repeatAllows(state, session, rule)) continue;
       for (const source of extractSources(exec.arguments)) {
@@ -1192,6 +1227,7 @@ function apply(ctx, config = {}) {
       if (output.content.length < 40) continue;
       const candidates = questionRules
         .filter((rule) => {
+          if (state.disabled.has(rule.name)) return false; // muted in THIS session
           if (output.kind === "text" && !rule.canText) return false;
           if (output.kind === "reasoning" && !rule.canReasoning) return false;
           if (output.kind === "tool") {
@@ -1357,19 +1393,23 @@ function apply(ctx, config = {}) {
     handler: (invocation) => runOmfg(ctx, settings, rules, invocation),
   });
 
-  /** Toggle one rule globally (used by /ttsr set, /ttsr on|off, and /ttsr-set).
-   *  Persists through the configEditor: the rulebook reloads live and the state
-   *  survives restarts and applies to every session. */
-  async function setSessionRule(invocation, name, mute) {
+  /** Toggle one rule for THIS session (used by /ttsr set, /ttsr on|off, and
+   *  /ttsr-set). Session-scoped: the change applies here only, persists with
+   *  this session (the command's own logged result feeds the projection), and
+   *  never touches another session or the global config. */
+  function setSessionRule(invocation, name, mute) {
     const target = rules.find((rule) => rule.name === name) ?? rules.find((rule) => rule.name.startsWith(name));
     if (target === undefined) return { kind: "error", text: `TTSR: no rule named "${name}".` };
-    const outcome = await setRuleDisabled(target.name, mute);
-    if (!outcome.ok) return { kind: "error", text: `TTSR: could not persist the change (${outcome.error}).` };
-    const snapshot = ruleSnapshot().map((entry) => (entry.name === target.name ? { ...entry, muted: mute } : entry));
-    return { kind: "success", text: `${SET_PREFIX}${JSON.stringify({ rules: snapshot })}` };
+    const state = stateOf(invocation.agent.id);
+    syncDisabled(state, sessionOf(invocation.agent));
+    const next = new Set(state.disabled);
+    if (mute) next.add(target.name);
+    else next.delete(target.name);
+    applyMutes(invocation.agent, next);
+    return { kind: "success", text: `${SET_PREFIX}${JSON.stringify({ rules: ruleSnapshot(state) })}` };
   }
 
-  const sessionHelpers = { setSessionRule, ruleSnapshot, setRuleDisabled };
+  const sessionHelpers = { setSessionRule, ruleSnapshot, applyMutes, syncDisabled, sessionOf };
 
   ctx.commands.register({
     name: "ttsr",
@@ -1569,11 +1609,15 @@ async function runTtsr(ctx, settings, rules, helpers, invocation) {
 
   if (command === "" ) {
     if (rules.length === 0) return { kind: "success", text: "TTSR: no rules configured. Use /omfg <description> to generate one." };
-    return { kind: "success", text: `${PANEL_PREFIX}${JSON.stringify({ rules: helpers.ruleSnapshot() })}` };
+    const state = stateOf(invocation.agent.id);
+    helpers.syncDisabled(state, helpers.sessionOf(invocation.agent));
+    return { kind: "success", text: `${PANEL_PREFIX}${JSON.stringify({ rules: helpers.ruleSnapshot(state) })}` };
   }
 
   if (command === "rules") {
     if (rules.length === 0) return { kind: "success", text: "TTSR: no rules configured. Use /omfg <description> to generate one." };
+    const state = stateOf(invocation.agent.id);
+    helpers.syncDisabled(state, helpers.sessionOf(invocation.agent));
     let selected;
     try {
       const answer = await ctx.userQuestions.ask({
@@ -1581,7 +1625,7 @@ async function runTtsr(ctx, settings, rules, helpers, invocation) {
           {
             id: "muted",
             header: "TTSR rules",
-            question: "All rules are active by default. CHECK a rule to DISABLE it — the change is global and persisted (every session, survives restarts). Everything left unchecked stays active. Submitting with nothing checked re-enables everything.",
+            question: "All rules are active by default. CHECK a rule to DISABLE it for THIS session only — other sessions and the global config are not affected, and the choice persists with this session. Everything left unchecked stays active. Submitting with nothing checked re-enables everything here.",
             options: rules.map((rule) => {
               const trigger =
                 rule.regex !== null ? `/${rule.condition}/` : rule.astItems !== null ? `ast: ${rule.astCondition}` : rule.turnEnd ? `turn-end: ${rule.question.slice(0, 60)}` : `judge: ${rule.question.slice(0, 60)}`;
@@ -1600,18 +1644,11 @@ async function runTtsr(ctx, settings, rules, helpers, invocation) {
       return { kind: "error", text: `TTSR: could not open the rule panel (${error.message}). Use /ttsr off <name> instead.` };
     }
     if (selected === null) return { kind: "success", text: "TTSR: rule panel closed without changes." };
-    const muteNames = new Set(selected.filter((label) => rules.some((rule) => rule.name === label)));
-    let lastError = null;
-    for (const rule of rules) {
-      const shouldMute = muteNames.has(rule.name);
-      if (rule.disabled === shouldMute) continue;
-      const outcome = await helpers.setRuleDisabled(rule.name, shouldMute);
-      if (!outcome.ok) lastError = outcome.error;
-    }
-    if (lastError !== null) return { kind: "error", text: `TTSR: some changes failed (${lastError}).` };
+    const next = new Set(selected.filter((label) => rules.some((rule) => rule.name === label)));
+    helpers.applyMutes(invocation.agent, next);
     return {
       kind: "success",
-      text: `${SET_PREFIX}${JSON.stringify({ rules: helpers.ruleSnapshot() })}`,
+      text: `${SET_PREFIX}${JSON.stringify({ rules: helpers.ruleSnapshot(stateOf(invocation.agent.id)) })}`,
     };
   }
 
@@ -1628,32 +1665,20 @@ async function runTtsr(ctx, settings, rules, helpers, invocation) {
   if (command === "off" || command === "on") {
     if (rest.length === 0) {
       if (command === "off") return { kind: "success", text: "TTSR: /ttsr off needs a rule name, or use /ttsr mute to silence everything." };
-      let lastError = null;
-      for (const rule of rules) {
-        if (!rule.disabled) continue;
-        const outcome = await helpers.setRuleDisabled(rule.name, false);
-        if (!outcome.ok) lastError = outcome.error;
-      }
-      if (lastError !== null) return { kind: "error", text: `TTSR: some re-enables failed (${lastError}).` };
+      helpers.applyMutes(invocation.agent, new Set());
       return {
         kind: "success",
-        text: `${SET_PREFIX}${JSON.stringify({ rules: helpers.ruleSnapshot() })}`,
+        text: `${SET_PREFIX}${JSON.stringify({ rules: helpers.ruleSnapshot(stateOf(invocation.agent.id)) })}`,
       };
     }
     return helpers.setSessionRule(invocation, rest, command === "off");
   }
 
   if (command === "mute") {
-    let lastError = null;
-    for (const rule of rules) {
-      if (rule.disabled) continue;
-      const outcome = await helpers.setRuleDisabled(rule.name, true);
-      if (!outcome.ok) lastError = outcome.error;
-    }
-    if (lastError !== null) return { kind: "error", text: `TTSR: some mutes failed (${lastError}).` };
+    helpers.applyMutes(invocation.agent, new Set(rules.filter((rule) => !rule.disabled).map((rule) => rule.name)));
     return {
       kind: "success",
-      text: `${SET_PREFIX}${JSON.stringify({ rules: helpers.ruleSnapshot() })}`,
+      text: `${SET_PREFIX}${JSON.stringify({ rules: helpers.ruleSnapshot(stateOf(invocation.agent.id)) })}`,
     };
   }
 
@@ -1719,6 +1744,8 @@ async function runTtsr(ctx, settings, rules, helpers, invocation) {
   if (rules.length === 0) {
     return { kind: "success", text: "TTSR: no rules configured. Use /omfg <description> to generate one." };
   }
+  const listState = stateOf(invocation.agent.id);
+  helpers.syncDisabled(listState, helpers.sessionOf(invocation.agent));
   const lines = rules.map((rule) => {
     const triggers = [
       rule.regex !== null ? `/${rule.condition}/` : null,
@@ -1730,12 +1757,19 @@ async function runTtsr(ctx, settings, rules, helpers, invocation) {
     const scope = rule.scope.join("+");
     const tools = rule.tools.length > 0 ? ` tools:${rule.tools.join(",")}` : "";
     const globs = rule.globs.length > 0 ? ` globs:${rule.globs.join(",")}` : "";
-    const muted = rule.disabled ? " [DISABLED — global, persisted]" : "";
-    return `- ${rule.name} [${triggers}] scope=${scope}${tools}${globs} interrupt=${rule.interruptMode} repeat=${rule.repeatMode}${muted}`;
+    const mark =
+      listState.disabled.has(rule.name) && rule.disabled
+        ? " [MUTED this session + DISABLED globally]"
+        : listState.disabled.has(rule.name)
+          ? " [MUTED this session]"
+          : rule.disabled
+            ? " [DISABLED — global config]"
+            : "";
+    return `- ${rule.name} [${triggers}] scope=${scope}${tools}${globs} interrupt=${rule.interruptMode} repeat=${rule.repeatMode}${mark}`;
   });
   return {
     kind: "success",
-    text: `TTSR ${settings.enabled ? "enabled" : "DISABLED"}, ${rules.length} rule(s):\n${lines.join("\n")}\nFired rules are suppressed per their repeat policy; state survives reload.`,
+    text: `TTSR ${settings.enabled ? "enabled" : "DISABLED"}, ${rules.length} rule(s), this session's mutes persist with the session:\n${lines.join("\n")}\nFired rules are suppressed per their repeat policy; state survives reload.`,
   };
 }
 
