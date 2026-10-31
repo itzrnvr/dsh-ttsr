@@ -222,6 +222,32 @@ function resolveSettings(config, logger) {
             ...(typeof rawJudge.launch.cwd === "string" && rawJudge.launch.cwd.length > 0 ? { cwd: rawJudge.launch.cwd } : {}),
           }
         : undefined,
+    // Optional separate gate judge (e.g. hosted Jev): fixed endpoint, so the
+    // gate is the SAME judge in every session type. Absent -> the primary
+    // judge (local qev) also runs the gate. kind "jev" defaults the baseUrl
+    // to the TypeSafe API and sends model/apiKey on the same System One wire.
+    gate: rawJudge.gate !== null && typeof rawJudge.gate === "object" && !Array.isArray(rawJudge.gate)
+      ? {
+          kind: rawJudge.gate.kind === "jev" ? "jev" : "qev",
+          baseUrl:
+            typeof rawJudge.gate.baseUrl === "string" && rawJudge.gate.baseUrl.length > 0
+              ? rawJudge.gate.baseUrl
+              : rawJudge.gate.kind === "jev"
+                ? "https://api.typesafe.ai"
+                : judge.baseUrl,
+          apiKey: typeof rawJudge.gate.apiKey === "string" ? rawJudge.gate.apiKey : undefined,
+          model:
+            typeof rawJudge.gate.model === "string" && rawJudge.gate.model.length > 0
+              ? rawJudge.gate.model
+              : rawJudge.gate.kind === "jev"
+                ? "jev-1.14.0"
+                : undefined,
+          clearThreshold:
+            Number.isFinite(rawJudge.gate.clearThreshold) && rawJudge.gate.clearThreshold > 0 && rawJudge.gate.clearThreshold < 1
+              ? rawJudge.gate.clearThreshold
+              : Math.min(judge.threshold, 0.5),
+        }
+      : undefined,
   };
   const rules = [];
   const seen = new Set();
@@ -241,6 +267,19 @@ function resolveSettings(config, logger) {
 // ---------------------------------------------------------------------------
 // Message helpers (no cross-package imports: shapes match dsh-llm exactly)
 // ---------------------------------------------------------------------------
+
+/** Deterministic self-reference mask for judged text: strips injected
+ *  reminder envelopes (they contain rule text) and replaces every rule name
+ *  with [rule], so a turn that merely discusses or configures the rule system
+ *  cannot self-match its own rules. Free and session-independent. */
+function maskTurnText(text, ruleNames) {
+  let masked = text.replace(/<system-interrupt\b[\s\S]*?<\/system-interrupt>/g, "[reminder]");
+  for (const name of ruleNames) {
+    if (typeof name !== "string" || name.length === 0) continue;
+    masked = masked.split(name).join("[rule]");
+  }
+  return masked;
+}
 
 const XML_AMP = String.fromCharCode(38) + "amp;";
 const XML_LT = String.fromCharCode(38) + "lt;";
@@ -472,11 +511,15 @@ function apply(ctx, config = {}) {
     return baseUrl;
   }
 
-  async function qevDecide(baseUrl, state, questions) {
+  async function qevDecide(baseUrl, state, questions, opts = {}) {
+    const headers = { "content-type": "application/json" };
+    if (typeof opts.apiKey === "string" && opts.apiKey.length > 0) headers.authorization = `Bearer ${opts.apiKey}`;
+    const body = { state, questions };
+    if (typeof opts.model === "string" && opts.model.length > 0) body.model = opts.model;
     const response = await fetch(`${baseUrl}/v1/systemone`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ state, questions }),
+      headers,
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(45000),
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -620,7 +663,7 @@ function apply(ctx, config = {}) {
         role: "assistant_turn",
         user_request: userRequest ?? "(the user's request is not available)",
         turn_actions: `${turnTools.length} tool call(s): ${[...new Set(turnTools)].join(", ") || "none"}`,
-        turn_text: truncateMiddle(turnText, 16000),
+        turn_text: truncateMiddle(maskTurnText(turnText, rules.map((rule) => rule.name)), 16000),
       };
       answers = await qevDecide(baseUrl, decisionState, questions);
       pluginLog("judge turn-end", {
@@ -648,22 +691,34 @@ function apply(ctx, config = {}) {
     // Without this gate, turns dense in rule vocabulary fire their own rules.
     let gateAnswers = null;
     try {
+      const gate = settings.judge.gate;
+      const gateBaseUrl = gate !== undefined ? gate.baseUrl : baseUrl;
       const gateQuestions = {};
       for (const rule of preliminary) {
         gateQuestions[rule.name] = {
           type: "noul",
-          instructions:
-            "Is the ONLY role of the prohibited wording in this turn to cite, quote, configure, or analyze the rule system itself (for example an assistant engineering, migrating, or documenting these rules), with no recommending, concluding, planning, or acting on the prohibited behavior anywhere in the turn?",
+          instructions: `Rule "${rule.name}" prohibits: ${rule.message} In this turn, is the ONLY role of this rule's subject matter to cite, quote, configure, or analyze the rule system itself (rule names, rule text, config entries, migration summaries), with no recommending, concluding, planning, or acting on the prohibited behavior anywhere in the turn?`,
         };
       }
-      gateAnswers = await qevDecide(baseUrl, decisionState, gateQuestions);
+      gateAnswers = await qevDecide(gateBaseUrl, decisionState, gateQuestions, gate !== undefined ? { apiKey: gate.apiKey, model: gate.model } : {});
+      pluginLog("judge turn-end gate", {
+        session: session.id,
+        judge: gate !== undefined ? gate.kind : "primary",
+        scores: Object.fromEntries(
+          preliminary.map((rule) => [
+            rule.name,
+            typeof gateAnswers[rule.name]?.noul === "number" ? Number(gateAnswers[rule.name].noul.toFixed(2)) : null,
+          ]),
+        ),
+      });
     } catch (error) {
       pluginLog("judge turn-end gate failed", { session: session.id, error: error.message });
     }
+    const gateClear = settings.judge.gate !== undefined ? settings.judge.gate.clearThreshold : Math.min(threshold, 0.5);
     const violations = [];
     for (const rule of preliminary) {
       const discussionOnly = gateAnswers?.[rule.name]?.noul;
-      if (typeof discussionOnly === "number" && discussionOnly >= threshold) {
+      if (typeof discussionOnly === "number" && discussionOnly >= gateClear) {
         pluginLog("judge turn-end gate cleared", {
           session: session.id,
           rule: rule.name,
