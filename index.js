@@ -697,7 +697,7 @@ function apply(ctx, config = {}) {
       for (const rule of preliminary) {
         gateQuestions[rule.name] = {
           type: "noul",
-          instructions: `Rule "${rule.name}" prohibits: ${rule.message} In this turn, is the ONLY role of this rule's subject matter to cite, quote, configure, or analyze the rule system itself (rule names, rule text, config entries, migration summaries), with no recommending, concluding, planning, or acting on the prohibited behavior anywhere in the turn?`,
+          instructions: `Rule "${rule.name}" prohibits: ${rule.message} Is this turn's discussion of that subject merely descriptive (mentioning, measuring, benchmarking, analyzing, or reporting on it — including citing or engineering the rule system itself), with no recommending, concluding, planning, or acting on the prohibited behavior anywhere in the turn?`,
         };
       }
       gateAnswers = await qevDecide(gateBaseUrl, decisionState, gateQuestions, gate !== undefined ? { apiKey: gate.apiKey, model: gate.model } : {});
